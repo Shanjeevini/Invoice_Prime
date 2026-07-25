@@ -1,0 +1,22 @@
+# Secrets — never commit these
+.streamlit/
+secrets.toml
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# App output (regenerated at runtime, don't need to track it)
+extracted_invoices/
+
+# OS/editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

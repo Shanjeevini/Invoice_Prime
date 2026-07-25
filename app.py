@@ -2,43 +2,21 @@ import streamlit as st
 import json
 import os
 import re
-from datetime import datetime
 from typing import List, Optional
 
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
-# ─────────────────────────────────────────
-# 🔑 API CLIENT (Gemini)
-# ─────────────────────────────────────────
 _api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
 client = genai.Client(api_key=_api_key)
 
-# Stable GA model. Google retires Gemini model versions fairly often — if
-# this one ever 404s with "no longer available", check
-# https://ai.google.dev/gemini-api/docs/models for the current GA Flash
-# model name and swap it in here. As of July 2026, "gemini-3.6-flash" is the
-# newest GA option if you want to try it instead.
 GEMINI_MODEL = "gemini-3.5-flash"
-
-# Where extracted invoices are persisted as JSON on disk, in addition to the
-# in-app download button.
-
-
 
 st.set_page_config(page_title="Invoice Extractor", layout="wide")
 
 GSTIN_PATTERN = r'\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}Z[A-Z\d]{1}\b'
 
-# ─────────────────────────────────────────
-# 📖 KNOWN LABEL GLOSSARY
-# The model reads vendor/customer sections by meaning, not by keyword matching,
-# so this list doesn't drive extraction — it's just a running reference of
-# wording you've already seen. When an invoice uses phrasing not in these
-# lists, it gets flagged in the UI so you can review it and, if it's a genuine
-# new pattern worth tracking, add it here yourself.
-# ─────────────────────────────────────────
 KNOWN_VENDOR_LABELS = [
     "sold by", "seller", "vendor", "supplier", "from", "issued by",
     "dispatched by",
@@ -58,26 +36,16 @@ def _normalize_label(label):
 
 
 def _strip_rate_suffix(label):
-    # "CGST@9%" / "CGST 9%" / "CGST(9%)" -> "cgst", so a known label with a
-    # different rate tacked on doesn't get flagged as if it were new wording.
     return re.sub(r'[@(]?\s*[\d.]+\s*%\)?', '', label).strip()
 
 
 def _is_known(normalized, known_list):
-
     if normalized in known_list:
         return True
     return any(re.search(rf'\b{re.escape(known)}\b', normalized) for known in known_list)
 
 
 def audit_labels(final):
-    """
-    Returns every label the model reported (vendor, customer, each tax line),
-    tagged as known or new against the glossaries above. Always returns
-    entries for whatever was actually detected — not just the unmatched ones —
-    so you can see the full picture of wording used on each invoice, not only
-    the rare miss.
-    """
     entries = []
 
     v_label = final.get("vendor_label_used")
@@ -100,21 +68,13 @@ def audit_labels(final):
     return entries
 
 
-
-
 class TaxLine(BaseModel):
-    label: Optional[str] = None          
-    rate_percent: Optional[str] = None   
-    amount: Optional[str] = None        
+    label: Optional[str] = None
+    rate_percent: Optional[str] = None
+    amount: Optional[str] = None
 
 
 class HsnSummaryLine(BaseModel):
-    """
-    Some invoices carry a SECOND table, separate from the main line-item
-    table, that groups quantities/amounts/tax by HSN code (e.g. columns like
-    HSN | QTY | BILL AMT | CGST | SGST). This is optional — most invoices
-    don't have one — so this list just stays empty when it's absent.
-    """
     hsn_code: Optional[str] = None
     quantity: Optional[str] = None
     bill_amount: Optional[str] = None
@@ -134,7 +94,7 @@ class InvoiceItem(BaseModel):
     amount: Optional[str] = None
     tax_rate_percent: Optional[str] = None
     tax_amount: Optional[str] = None
-    total_amount: Optional[str] = None  
+    total_amount: Optional[str] = None
 
 
 class InvoiceData(BaseModel):
@@ -279,14 +239,7 @@ FIELD RULES:
 """
 
 
-
-
 def extract_invoice(file_bytes, mime_type="application/pdf"):
-    """
-    Sends the file directly to Gemini — no OCR, no PDF-to-image rendering, no
-    poppler/pytesseract dependency. Gemini reads digital-text and
-    scanned/image PDFs natively in the same call.
-    """
     import time
 
     max_attempts = 3
@@ -308,18 +261,16 @@ def extract_invoice(file_bytes, mime_type="application/pdf"):
             )
             if response.parsed is not None:
                 return response.parsed.model_dump(), None
-            # Fallback: schema-valid JSON text even if .parsed didn't populate
             return json.loads(response.text), None
         except Exception as e:
             last_error = e
             transient = "UNAVAILABLE" in str(e) or "503" in str(e) or "overloaded" in str(e).lower()
             if transient and attempt < max_attempts:
-                time.sleep(2 * attempt)  # 2s, then 4s
+                time.sleep(2 * attempt)
                 continue
             break
 
     return {}, f"Gemini extraction error: {str(last_error)}"
-
 
 
 def is_empty(val):
@@ -337,14 +288,12 @@ def clean_customer_name(name):
 def postprocess(data):
     final = {k: v for k, v in data.items() if k != "items"}
 
-
     if final.get("vendor_gstin") and final.get("customer_gstin"):
         if final["vendor_gstin"] == final["customer_gstin"]:
             final["customer_gstin"] = None
 
     if final.get("customer_name"):
         final["customer_name"] = clean_customer_name(final["customer_name"])
-
 
     taxes = final.get("taxes") or []
     total_tax = final.get("total_tax")
@@ -376,22 +325,10 @@ def postprocess(data):
     return final
 
 
-def save_json(final_result, filename_hint):
-    safe_name = re.sub(r'[^A-Za-z0-9_\-]', '_', str(final_result.get("invoice_number") or filename_hint))
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(OUTPUT_DIR, f"{safe_name}_{timestamp}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(final_result, f, indent=4, ensure_ascii=False)
-    return path
-
-
-# ─────────────────────────────────────────
-# 🎨 STREAMLIT UI
-# ─────────────────────────────────────────
-
 st.title("📄Invoice Extractor")
 st.caption(
-    "Powered by Gemini — reads digital PDFs, scanned/photographed invoices,and handwritten bills "
+    "Powered by Gemini — reads digital PDFs, scanned/photographed invoices, "
+    "and handwritten bills"
 )
 
 uploaded_files = st.file_uploader(
@@ -412,8 +349,6 @@ if uploaded_files:
             continue
 
         final_result = postprocess(llm_data)
-        saved_path = save_json(final_result, uploaded_file.name.rsplit(".", 1)[0])
-        st.success(f"✅ Extracted and saved to `{saved_path}`")
 
         new_entries = [e for e in audit_labels(final_result) if not e["known"]]
         if new_entries:
@@ -488,11 +423,6 @@ if uploaded_files:
                 if not is_empty(rate):
                     parts.append(f"{rate}%")
                 if not is_empty(amount):
-                    # If the printed label itself contains a "%" (e.g. this
-                    # invoice's own row literally says "GST %") but only an
-                    # amount was found — not an actual rate — make it clear
-                    # this number is money, not a percentage, so it doesn't
-                    # read as an invalid rate like "525%".
                     if "%" in label and is_empty(rate):
                         parts.append(f"{amount} (amount, not a rate — invoice's own label says \"%\")")
                     else:

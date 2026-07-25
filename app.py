@@ -15,18 +15,30 @@ from google.genai import types
 _api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
 client = genai.Client(api_key=_api_key)
 
-
+# Stable GA model. Google retires Gemini model versions fairly often — if
+# this one ever 404s with "no longer available", check
+# https://ai.google.dev/gemini-api/docs/models for the current GA Flash
+# model name and swap it in here. As of July 2026, "gemini-3.6-flash" is the
+# newest GA option if you want to try it instead.
 GEMINI_MODEL = "gemini-3.5-flash"
 
+# Where extracted invoices are persisted as JSON on disk, in addition to the
+# in-app download button.
 
-OUTPUT_DIR = "extracted_invoices"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 
 st.set_page_config(page_title="Invoice Extractor", layout="wide")
 
 GSTIN_PATTERN = r'\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}Z[A-Z\d]{1}\b'
 
-
+# ─────────────────────────────────────────
+# 📖 KNOWN LABEL GLOSSARY
+# The model reads vendor/customer sections by meaning, not by keyword matching,
+# so this list doesn't drive extraction — it's just a running reference of
+# wording you've already seen. When an invoice uses phrasing not in these
+# lists, it gets flagged in the UI so you can review it and, if it's a genuine
+# new pattern worth tracking, add it here yourself.
+# ─────────────────────────────────────────
 KNOWN_VENDOR_LABELS = [
     "sold by", "seller", "vendor", "supplier", "from", "issued by",
     "dispatched by",
@@ -46,9 +58,16 @@ def _normalize_label(label):
 
 
 def _strip_rate_suffix(label):
+    # "CGST@9%" / "CGST 9%" / "CGST(9%)" -> "cgst", so a known label with a
+    # different rate tacked on doesn't get flagged as if it were new wording.
     return re.sub(r'[@(]?\s*[\d.]+\s*%\)?', '', label).strip()
-    
-    
+
+
+def _is_known(normalized, known_list):
+
+    if normalized in known_list:
+        return True
+    return any(re.search(rf'\b{re.escape(known)}\b', normalized) for known in known_list)
 
 
 def audit_labels(final):
@@ -63,19 +82,19 @@ def audit_labels(final):
 
     v_label = final.get("vendor_label_used")
     if v_label:
-        known = _normalize_label(v_label) in KNOWN_VENDOR_LABELS
+        known = _is_known(_normalize_label(v_label), KNOWN_VENDOR_LABELS)
         entries.append({"category": "Vendor", "label": v_label, "known": known})
 
     c_label = final.get("customer_label_used")
     if c_label:
-        known = _normalize_label(c_label) in KNOWN_CUSTOMER_LABELS
+        known = _is_known(_normalize_label(c_label), KNOWN_CUSTOMER_LABELS)
         entries.append({"category": "Customer", "label": c_label, "known": known})
 
     for tax_line in final.get("taxes") or []:
         label = tax_line.get("label") if isinstance(tax_line, dict) else None
         if not label:
             continue
-        known = _normalize_label(_strip_rate_suffix(label)) in KNOWN_TAX_LABELS
+        known = _is_known(_normalize_label(_strip_rate_suffix(label)), KNOWN_TAX_LABELS)
         entries.append({"category": "Tax", "label": label, "known": known})
 
     return entries
@@ -84,9 +103,9 @@ def audit_labels(final):
 
 
 class TaxLine(BaseModel):
-    label: Optional[str] = None          # verbatim as printed, e.g. "CGST@9%", "VAT", "Service Tax"
-    rate_percent: Optional[str] = None   # if a % is printed for this line
-    amount: Optional[str] = None         # if a currency amount is printed for this line
+    label: Optional[str] = None          
+    rate_percent: Optional[str] = None   
+    amount: Optional[str] = None        
 
 
 class HsnSummaryLine(BaseModel):
@@ -115,6 +134,7 @@ class InvoiceItem(BaseModel):
     amount: Optional[str] = None
     tax_rate_percent: Optional[str] = None
     tax_amount: Optional[str] = None
+    total_amount: Optional[str] = None  
 
 
 class InvoiceData(BaseModel):
@@ -179,14 +199,24 @@ LINE ITEMS: read each table's column HEADERS to map fields correctly — never a
 column position, different invoices order columns differently.
 - "quantity" = the units/count column. "unit_price" = the per-unit rate, before tax
   and before discount.
-- "amount" = whatever the row's own total/net column shows (often quantity ×
-  unit_price) — use exactly what's printed under that column, whatever it's labeled
-  (Amount, Net Amount, Total, etc). Do not invent a separate "taxable amount" field
-  if the invoice only has one such column.
-- Tax per row: if the row shows a tax RATE (e.g. "GST% = 5.00"), put that number in
-  tax_rate_percent. If the row instead shows a tax AMOUNT in currency, put that in
-  tax_amount. Only fill whichever one is actually printed for that row — most
-  invoices show only one, not both, and most do NOT break tax into separate lines
+- "amount" = the row's PRE-TAX net/taxable value — if the table has a column
+  literally named "Taxable Amount"/"Net Amount", use that one specifically. If
+  the table only has ONE total-like column with no separate pre/post-tax split,
+  use that single column here instead (don't invent a taxable-amount split that
+  doesn't exist).
+- "total_amount" (item-level, optional) = ONLY fill this if the SAME row also
+  prints its own separate GRAND TOTAL column (i.e. the row shows two distinct
+  numbers: a pre-tax amount AND a separate post-tax total, e.g. "Taxable
+  Amount" next to "Total"). If the row only has one total-like figure, leave
+  this null — don't duplicate "amount" into it.
+- Tax per row: if the row shows a tax RATE (e.g. "GST% = 5.00"), put that number
+  in tax_rate_percent. If the row shows a tax AMOUNT in currency directly, put
+  that in tax_amount. If the row instead prints BOTH a pre-tax amount and a
+  separate post-tax total (as above) but no explicit tax-amount column, COMPUTE
+  tax_amount as (total_amount − amount) for that row — this is not invented,
+  it's arithmetic on two numbers already printed on that exact row. Otherwise,
+  if only a rate or only a single combined figure is shown, leave tax_amount
+  null rather than guessing. Most invoices do NOT break tax into separate lines
   per row (that split, if present at all, is usually only in an invoice-level
   summary box, which belongs in the top-level "taxes" list instead, not per item).
 - If a discount is shown only ONCE for the whole invoice (e.g. "Discount 17%" in a
@@ -249,9 +279,7 @@ FIELD RULES:
 """
 
 
-# ─────────────────────────────────────────
-# 🤖 EXTRACTION
-# ─────────────────────────────────────────
+
 
 def extract_invoice(file_bytes, mime_type="application/pdf"):
     """
@@ -284,10 +312,6 @@ def extract_invoice(file_bytes, mime_type="application/pdf"):
             return json.loads(response.text), None
         except Exception as e:
             last_error = e
-            # 503/UNAVAILABLE means Google's servers are temporarily
-            # overloaded — not a bug on our end. Worth a couple of short
-            # retries before giving up, since it usually clears within
-            # seconds. Anything else (bad key, invalid file, etc.) fails fast.
             transient = "UNAVAILABLE" in str(e) or "503" in str(e) or "overloaded" in str(e).lower()
             if transient and attempt < max_attempts:
                 time.sleep(2 * attempt)  # 2s, then 4s
@@ -295,7 +319,6 @@ def extract_invoice(file_bytes, mime_type="application/pdf"):
             break
 
     return {}, f"Gemini extraction error: {str(last_error)}"
-
 
 
 
@@ -366,7 +389,7 @@ def save_json(final_result, filename_hint):
 # 🎨 STREAMLIT UI
 # ─────────────────────────────────────────
 
-st.title("📄 Invoice Extractor")
+st.title("📄Invoice Extractor")
 st.caption(
     "Powered by Gemini — reads digital PDFs, scanned/photographed invoices,and handwritten bills "
 )
@@ -435,7 +458,7 @@ if uploaded_files:
             items = final_result["items"]
             preferred_cols = ["sl_no", "description", "hsn_sac_code", "quantity",
                                "unit_price", "discount_amount", "amount",
-                               "tax_rate_percent", "tax_amount"]
+                               "tax_rate_percent", "tax_amount", "total_amount"]
             df = pd.DataFrame(items)
             ordered = [c for c in preferred_cols if c in df.columns]
             df = df[ordered + [c for c in df.columns if c not in ordered]]

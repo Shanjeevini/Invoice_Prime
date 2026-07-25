@@ -368,8 +368,7 @@ def save_json(final_result, filename_hint):
 
 st.title("📄 Invoice Extractor")
 st.caption(
-    "Powered by Gemini — reads digital PDFs, scanned/photographed invoices, "
-    "and handwritten bills 
+    "Powered by Gemini — reads digital PDFs, scanned/photographed invoices,and handwritten bills "
 )
 
 uploaded_files = st.file_uploader(

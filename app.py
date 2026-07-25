@@ -15,30 +15,18 @@ from google.genai import types
 _api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
 client = genai.Client(api_key=_api_key)
 
-# Stable GA model. Google retires Gemini model versions fairly often — if
-# this one ever 404s with "no longer available", check
-# https://ai.google.dev/gemini-api/docs/models for the current GA Flash
-# model name and swap it in here. As of July 2026, "gemini-3.6-flash" is the
-# newest GA option if you want to try it instead.
+
 GEMINI_MODEL = "gemini-3.5-flash"
 
-# Where extracted invoices are persisted as JSON on disk, in addition to the
-# in-app download button.
+
 OUTPUT_DIR = "extracted_invoices"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-st.set_page_config(page_title="Universal Invoice Extractor", layout="wide")
+st.set_page_config(page_title="Invoice Extractor", layout="wide")
 
 GSTIN_PATTERN = r'\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}Z[A-Z\d]{1}\b'
 
-# ─────────────────────────────────────────
-# 📖 KNOWN LABEL GLOSSARY
-# The model reads vendor/customer sections by meaning, not by keyword matching,
-# so this list doesn't drive extraction — it's just a running reference of
-# wording you've already seen. When an invoice uses phrasing not in these
-# lists, it gets flagged in the UI so you can review it and, if it's a genuine
-# new pattern worth tracking, add it here yourself.
-# ─────────────────────────────────────────
+
 KNOWN_VENDOR_LABELS = [
     "sold by", "seller", "vendor", "supplier", "from", "issued by",
     "dispatched by",
@@ -58,9 +46,9 @@ def _normalize_label(label):
 
 
 def _strip_rate_suffix(label):
-    # "CGST@9%" / "CGST 9%" / "CGST(9%)" -> "cgst", so a known label with a
-    # different rate tacked on doesn't get flagged as if it were new wording.
     return re.sub(r'[@(]?\s*[\d.]+\s*%\)?', '', label).strip()
+    
+    
 
 
 def audit_labels(final):
@@ -93,15 +81,7 @@ def audit_labels(final):
     return entries
 
 
-# ─────────────────────────────────────────
-# 📐 STRUCTURED OUTPUT SCHEMA
-# Gemini enforces this shape server-side (response_mime_type=json +
-# response_schema), so — unlike the old Groq pipeline — a malformed / cut-off
-# JSON response is no longer possible. What's still not guaranteed is that
-# individual *values* are correct (e.g. vendor vs customer GSTIN swapped),
-# which is why the prompt below spells those rules out explicitly and a light
-# post-processing pass double-checks the highest-risk fields.
-# ─────────────────────────────────────────
+
 
 class TaxLine(BaseModel):
     label: Optional[str] = None          # verbatim as printed, e.g. "CGST@9%", "VAT", "Service Tax"
@@ -317,11 +297,7 @@ def extract_invoice(file_bytes, mime_type="application/pdf"):
     return {}, f"Gemini extraction error: {str(last_error)}"
 
 
-# ─────────────────────────────────────────
-# 🔗 POST-PROCESSING / SANITY CHECKS
-# Values are trusted from the model, but the historically riskiest fields
-# (duplicate GSTIN, malformed PAN/HSN) still get a light pass.
-# ─────────────────────────────────────────
+
 
 def is_empty(val):
     return val in [None, "", "null", "NOT FOUND", "N/A", "n/a", [], {}]
@@ -338,9 +314,7 @@ def clean_customer_name(name):
 def postprocess(data):
     final = {k: v for k, v in data.items() if k != "items"}
 
-    # Duplicate/missing GSTIN safety net (no raw OCR text to fall back on
-    # anymore, so this just prevents an obviously-wrong duplicate from
-    # slipping through — it cannot recover a genuinely missing second GSTIN).
+
     if final.get("vendor_gstin") and final.get("customer_gstin"):
         if final["vendor_gstin"] == final["customer_gstin"]:
             final["customer_gstin"] = None
@@ -348,10 +322,7 @@ def postprocess(data):
     if final.get("customer_name"):
         final["customer_name"] = clean_customer_name(final["customer_name"])
 
-    # Defense-in-depth: if the model still returns a single "taxes" entry
-    # whose amount just repeats total_tax (a combined figure mislabeled as if
-    # it were its own distinct tax type), drop it — it's not real breakdown
-    # information, total_tax alone already covers it.
+
     taxes = final.get("taxes") or []
     total_tax = final.get("total_tax")
     if len(taxes) == 1 and total_tax:
@@ -395,11 +366,10 @@ def save_json(final_result, filename_hint):
 # 🎨 STREAMLIT UI
 # ─────────────────────────────────────────
 
-st.title("📄 Universal Invoice Extractor")
+st.title("📄 Invoice Extractor")
 st.caption(
     "Powered by Gemini — reads digital PDFs, scanned/photographed invoices, "
-    "and handwritten bills in the same pipeline, no OCR step needed. Each "
-    f"invoice is saved as JSON in `{OUTPUT_DIR}/` and available to download."
+    "and handwritten bills 
 )
 
 uploaded_files = st.file_uploader(

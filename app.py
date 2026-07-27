@@ -454,47 +454,49 @@ def reconcile_invoice_totals(final):
     if total_amount is None:
         return None
 
-    subtotal = _to_float(final.get("subtotal"))
-    total_tax = _to_float(final.get("total_tax"))
-
-    taxes = final.get("taxes") or []
-    taxes_sum = sum((_to_float(t.get("amount")) or 0.0) for t in taxes if isinstance(t, dict))
-    effective_tax = total_tax if total_tax is not None else (taxes_sum if taxes else None)
-
-    discount = _to_float(final.get("invoice_discount_amount"))
-    if discount is None and final.get("invoice_discount_percent") and subtotal is not None:
-        pct = _to_float(final.get("invoice_discount_percent"))
-        discount = round(subtotal * pct / 100, 2) if pct is not None else None
-
     adjustments = final.get("adjustments") or []
     adjustments_sum = sum((_to_float(a.get("amount")) or 0.0) for a in adjustments if isinstance(a, dict))
 
-    if subtotal is not None and effective_tax is not None:
-        expected_total = round(subtotal - (discount or 0.0) + effective_tax + adjustments_sum, 2)
-        basis = "subtotal − discount + tax + adjustments" if adjustments else "subtotal − discount + tax"
-    else:
-        # Fall back to summing each line item's own total — this is what
-        # correctly handles invoices where tax only applies to some rows
-        # (e.g. a service fee) and not others (e.g. the fare), since each
-        # item's own total already reflects whatever tax was on that row.
-        items = final.get("items") or []
-        items_total = 0.0
-        any_item_data = False
-        for it in items:
-            amt = _to_float(it.get("amount"))
-            tax_amt = _to_float(it.get("tax_amount"))
-            item_total = _to_float(it.get("total_amount"))
-            if item_total is not None:
-                items_total += item_total
-                any_item_data = True
-            elif amt is not None:
-                items_total += amt + (tax_amt or 0.0)
-                any_item_data = True
-        if not any_item_data:
-            return None
+    # Primary check: sum each line item's own total_amount. This is the most
+    # trustworthy path because it's grounded in per-row numbers that have
+    # already been validated/corrected (see fix_pretax_amount) — unlike the
+    # top-level "subtotal" field, which some invoices mislabel or print as
+    # already tax-inclusive (e.g. a "Sub Total" box that equals "Total").
+    # Only fall back to subtotal-based math when there's no usable item data.
+    items = final.get("items") or []
+    items_total = 0.0
+    any_item_data = False
+    for it in items:
+        amt = _to_float(it.get("amount"))
+        tax_amt = _to_float(it.get("tax_amount"))
+        item_total = _to_float(it.get("total_amount"))
+        if item_total is not None:
+            items_total += item_total
+            any_item_data = True
+        elif amt is not None:
+            items_total += amt + (tax_amt or 0.0)
+            any_item_data = True
+
+    if any_item_data:
         expected_total = round(items_total + adjustments_sum, 2)
         basis = ("sum of each line item's own total + adjustments" if adjustments
-                  else "sum of each line item's own total (tax applied per-row)")
+                  else "sum of each line item's own total")
+    else:
+        subtotal = _to_float(final.get("subtotal"))
+        total_tax = _to_float(final.get("total_tax"))
+        taxes = final.get("taxes") or []
+        taxes_sum = sum((_to_float(t.get("amount")) or 0.0) for t in taxes if isinstance(t, dict))
+        effective_tax = total_tax if total_tax is not None else (taxes_sum if taxes else None)
+
+        discount = _to_float(final.get("invoice_discount_amount"))
+        if discount is None and final.get("invoice_discount_percent") and subtotal is not None:
+            pct = _to_float(final.get("invoice_discount_percent"))
+            discount = round(subtotal * pct / 100, 2) if pct is not None else None
+
+        if subtotal is None or effective_tax is None:
+            return None
+        expected_total = round(subtotal - (discount or 0.0) + effective_tax + adjustments_sum, 2)
+        basis = "subtotal − discount + tax + adjustments" if adjustments else "subtotal − discount + tax"
 
     diff = round(total_amount - expected_total, 2)
     return {

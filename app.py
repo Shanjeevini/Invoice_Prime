@@ -30,6 +30,10 @@ KNOWN_TAX_LABELS = [
     "sales tax", "output tax",
 ]
 
+# Tolerance (in currency units) below which a total-mismatch is treated as
+# rounding noise rather than a real discrepancy.
+TALLY_TOLERANCE = 1.0
+
 
 def _normalize_label(label):
     return re.sub(r'[^a-z ]', '', label.lower()).strip()
@@ -185,6 +189,12 @@ column position, different invoices order columns differently.
   discount_amount null in that case.
 - Extract every row of the table, in the order shown, skip none. Do not add columns
   that don't exist on this particular invoice — leave those fields null.
+- IMPORTANT — tax base per row: whatever "amount" you record for a row is the ONLY
+  base that row's tax_rate_percent / tax_amount applies to. Some invoices (e.g.
+  travel/booking invoices) print several distinct charge lines — such as a base
+  fare/ticket line and a separate service-fee line — where tax (e.g. IGST/GST) is
+  charged ONLY on the service-fee line and NOT on the fare line. Never assume tax
+  applies uniformly across all rows; read each row's own printed tax figures only.
 
 INVOICE-LEVEL TAXES: do not force values into fixed CGST/SGST/IGST/VAT slots. Instead,
 list every distinct tax line actually printed in the invoice's totals/summary box as
@@ -285,6 +295,151 @@ def clean_customer_name(name):
     return re.sub(r'\s{2,}', ' ', name).strip() or None
 
 
+def _to_float(val):
+    """Best-effort numeric parse; returns None for anything non-numeric/empty."""
+    if is_empty(val):
+        return None
+    try:
+        cleaned = str(val).replace(",", "").replace("₹", "").replace("Rs.", "").strip()
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Rule 1: Split whatever tax lines were extracted into CGST / SGST / IGST
+# buckets (each with its own rate + amount), leaving unused buckets empty.
+# Anything that isn't one of those three (VAT, Cess, Service Tax, plain
+# "Tax", etc.) is kept as "other" so nothing gets silently dropped.
+# ---------------------------------------------------------------------------
+def classify_gst(taxes):
+    buckets = {"CGST": None, "SGST": None, "IGST": None}
+    others = []
+    for t in taxes or []:
+        if not isinstance(t, dict):
+            continue
+        label = (t.get("label") or "").upper()
+        entry = {"rate": t.get("rate_percent"), "amount": t.get("amount")}
+        if "CGST" in label and buckets["CGST"] is None:
+            buckets["CGST"] = entry
+        elif "SGST" in label and buckets["SGST"] is None:
+            buckets["SGST"] = entry
+        elif "IGST" in label and buckets["IGST"] is None:
+            buckets["IGST"] = entry
+        else:
+            others.append(t)
+    return buckets, others
+
+
+# ---------------------------------------------------------------------------
+# Rule 2: When an invoice has a separate HSN-wise summary table, match it
+# against the line items (grouped by HSN code) and flag any HSN group whose
+# summed line-item amount doesn't tally with what the summary table prints.
+# ---------------------------------------------------------------------------
+def match_items_to_hsn(items, hsn_summary):
+    if not items or not hsn_summary:
+        return []
+
+    grouped = {}
+    for it in items:
+        code = it.get("hsn_sac_code")
+        if not code:
+            continue
+        g = grouped.setdefault(code, {"amount": 0.0, "tax_amount": 0.0, "total_amount": 0.0, "count": 0})
+        amt = _to_float(it.get("amount")) or 0.0
+        tax_amt = _to_float(it.get("tax_amount")) or 0.0
+        item_total = _to_float(it.get("total_amount"))
+        g["amount"] += amt
+        g["tax_amount"] += tax_amt
+        g["total_amount"] += item_total if item_total is not None else (amt + tax_amt)
+        g["count"] += 1
+
+    results = []
+    for row in hsn_summary:
+        code = row.get("hsn_code")
+        g = grouped.get(code)
+        summary_bill = _to_float(row.get("bill_amount"))
+
+        entry = {
+            "hsn_code": code,
+            "summary_bill_amount": row.get("bill_amount"),
+            "summary_total_amount": row.get("total_amount"),
+            "items_matched": g["count"] if g else 0,
+            "items_amount_sum": round(g["amount"], 2) if g else None,
+        }
+
+        if not g:
+            entry["status"] = "⚠️ No matching line items for this HSN code"
+        elif summary_bill is None:
+            entry["status"] = "Cannot verify — no bill amount printed in summary row"
+        else:
+            diff = round(g["amount"] - summary_bill, 2)
+            entry["status"] = "✅ Matched" if abs(diff) <= TALLY_TOLERANCE else f"⚠️ Mismatch (Δ {diff:+.2f})"
+        results.append(entry)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Rule 3: Recompute what the invoice total *should* be from its own printed
+# parts, and compare against the printed total_amount. Handles the case
+# where tax only applies to part of the invoice (e.g. service fee, not
+# fare) by falling back to summing each line item's own total when a clean
+# subtotal + tax path isn't available.
+# ---------------------------------------------------------------------------
+def reconcile_invoice_totals(final):
+    total_amount = _to_float(final.get("total_amount"))
+    if total_amount is None:
+        return None
+
+    subtotal = _to_float(final.get("subtotal"))
+    total_tax = _to_float(final.get("total_tax"))
+
+    taxes = final.get("taxes") or []
+    taxes_sum = sum((_to_float(t.get("amount")) or 0.0) for t in taxes if isinstance(t, dict))
+    effective_tax = total_tax if total_tax is not None else (taxes_sum if taxes else None)
+
+    discount = _to_float(final.get("invoice_discount_amount"))
+    if discount is None and final.get("invoice_discount_percent") and subtotal is not None:
+        pct = _to_float(final.get("invoice_discount_percent"))
+        discount = round(subtotal * pct / 100, 2) if pct is not None else None
+
+    if subtotal is not None and effective_tax is not None:
+        expected_total = round(subtotal - (discount or 0.0) + effective_tax, 2)
+        basis = "subtotal − discount + tax"
+    else:
+        # Fall back to summing each line item's own total — this is what
+        # correctly handles invoices where tax only applies to some rows
+        # (e.g. a service fee) and not others (e.g. the fare), since each
+        # item's own total already reflects whatever tax was on that row.
+        items = final.get("items") or []
+        items_total = 0.0
+        any_item_data = False
+        for it in items:
+            amt = _to_float(it.get("amount"))
+            tax_amt = _to_float(it.get("tax_amount"))
+            item_total = _to_float(it.get("total_amount"))
+            if item_total is not None:
+                items_total += item_total
+                any_item_data = True
+            elif amt is not None:
+                items_total += amt + (tax_amt or 0.0)
+                any_item_data = True
+        if not any_item_data:
+            return None
+        expected_total = round(items_total, 2)
+        basis = "sum of each line item's own total (tax applied per-row)"
+
+    diff = round(total_amount - expected_total, 2)
+    return {
+        "basis": basis,
+        "expected_total": expected_total,
+        "printed_total": total_amount,
+        "difference": diff,
+        "needs_review": abs(diff) > TALLY_TOLERANCE,
+    }
+
+
 def postprocess(data):
     final = {k: v for k, v in data.items() if k != "items"}
 
@@ -321,6 +476,14 @@ def postprocess(data):
 
     if not final.get("invoice_number"):
         final["invoice_number"] = "NOT FOUND"
+
+    # Derived, non-schema fields — computed once here so both the UI and the
+    # downloaded JSON reflect the same reconciliation results.
+    gst_buckets, other_taxes = classify_gst(final.get("taxes"))
+    final["gst_breakdown"] = {"CGST": gst_buckets["CGST"], "SGST": gst_buckets["SGST"],
+                               "IGST": gst_buckets["IGST"], "other_taxes": other_taxes}
+    final["hsn_reconciliation"] = match_items_to_hsn(cleaned_items, final.get("hsn_summary"))
+    final["total_reconciliation"] = reconcile_invoice_totals(final)
 
     return final
 
@@ -411,11 +574,26 @@ if uploaded_files:
             if not is_empty(val):
                 amt_cols[idx % 3].write(f"**{field.replace('_', ' ').title()}:** {val}")
 
-        taxes = final_result.get("taxes") or []
-        if taxes:
-            st.markdown("**Tax Breakdown** *(as printed on the invoice)*")
-            tax_cols = st.columns(3)
-            for idx, tax_line in enumerate(taxes):
+        # ---------------- Rule 1: CGST / SGST / IGST split ----------------
+        st.markdown("**🧮 Tax Breakdown — CGST / SGST / IGST**")
+        gst = final_result.get("gst_breakdown") or {}
+        gst_cols = st.columns(3)
+        for col, key in zip(gst_cols, ["CGST", "SGST", "IGST"]):
+            bucket = gst.get(key)
+            with col:
+                if bucket and not is_empty(bucket.get("amount")):
+                    rate_txt = f"{bucket['rate']}%" if not is_empty(bucket.get("rate")) else "rate not printed"
+                    st.metric(label=key, value=str(bucket["amount"]))
+                    st.caption(rate_txt)
+                else:
+                    st.metric(label=key, value="—")
+                    st.caption("not applicable on this invoice")
+
+        other_taxes = gst.get("other_taxes") or []
+        if other_taxes:
+            st.markdown("**Other Tax Lines** *(as printed — VAT, Cess, Service Tax, etc.)*")
+            other_cols = st.columns(3)
+            for idx, tax_line in enumerate(other_taxes):
                 label = tax_line.get("label") or "Tax"
                 rate = tax_line.get("rate_percent")
                 amount = tax_line.get("amount")
@@ -423,20 +601,44 @@ if uploaded_files:
                 if not is_empty(rate):
                     parts.append(f"{rate}%")
                 if not is_empty(amount):
-                    if "%" in label and is_empty(rate):
-                        parts.append(f"{amount} (amount, not a rate — invoice's own label says \"%\")")
-                    else:
-                        parts.append(str(amount))
+                    parts.append(str(amount))
                 if parts:
-                    tax_cols[idx % 3].write(f"**{label}:** {' / '.join(parts)}")
+                    other_cols[idx % 3].write(f"**{label}:** {' / '.join(parts)}")
 
+        # ---------------- Rule 2: HSN summary + reconciliation ----------------
         hsn_summary = final_result.get("hsn_summary") or []
         if hsn_summary:
-            st.markdown("**📊 HSN-wise Summary** *(separate grouping table found on this invoice)*")
             import pandas as pd
+            st.markdown("**📊 HSN-wise Summary** *(separate grouping table found on this invoice)*")
             hsn_df = pd.DataFrame(hsn_summary)
             hsn_df = hsn_df.fillna("").replace("null", "").replace("None", "")
             st.dataframe(hsn_df, use_container_width=True, hide_index=True)
+
+            hsn_match = final_result.get("hsn_reconciliation") or []
+            if hsn_match:
+                st.markdown("**🔗 Line-item ↔ HSN Summary Match**")
+                match_df = pd.DataFrame(hsn_match)
+                st.dataframe(match_df, use_container_width=True, hide_index=True)
+                if any("Mismatch" in str(r.get("status", "")) or "No matching" in str(r.get("status", ""))
+                       for r in hsn_match):
+                    st.warning("⚠️ One or more HSN groups don't tally between the line-item table and "
+                               "the HSN summary table.")
+                    st.error("🚨 NEEDS HUMAN REVIEW")
+
+        # ---------------- Rule 3: Total reconciliation ----------------
+        recon = final_result.get("total_reconciliation")
+        if recon:
+            st.markdown("**✅ Total Amount Reconciliation**")
+            st.write(
+                f"Basis: *{recon['basis']}*  \n"
+                f"Expected total: **{recon['expected_total']}**  |  "
+                f"Printed total: **{recon['printed_total']}**"
+            )
+            if recon["needs_review"]:
+                st.write(f"⚠️ Difference found: **{recon['difference']:+.2f}**")
+                st.error("🚨 NEEDS HUMAN REVIEW — totals do not tally within tolerance.")
+            else:
+                st.success("Totals tally correctly.")
 
         with st.expander("📋 Full JSON Output"):
             st.json(final_result)

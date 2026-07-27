@@ -101,6 +101,7 @@ class InvoiceItem(BaseModel):
     hsn_sac_code: Optional[str] = None
     quantity: Optional[str] = None
     unit_price: Optional[str] = None
+    discount_percent: Optional[str] = None
     discount_amount: Optional[str] = None
     amount: Optional[str] = None
     tax_rate_percent: Optional[str] = None
@@ -217,7 +218,13 @@ column position, different invoices order columns differently.
 - If a discount is shown only ONCE for the whole invoice (e.g. "Discount 17%" in a
   totals/summary box, not repeated per row), that belongs in the top-level
   invoice_discount_percent / invoice_discount_amount instead — leave every item's
-  discount_amount null in that case.
+  discount_percent and discount_amount null in that case.
+- If a row's own discount is shown as a currency figure (e.g. a "Discount" column
+  with "-₹33.90"), put that in discount_amount. If a row's own discount is shown as
+  a percentage instead (e.g. "10%" in a per-row discount column), put that in
+  discount_percent. If a row shows both its own percent AND its own amount, fill
+  both. If a row has no discount column value at all (blank, "0.00", or the column
+  doesn't apply to that row), leave both null rather than inventing "0".
 - Extract every row of the table, in the order shown, skip none. Do not add columns
   that don't exist on this particular invoice — leave those fields null.
 - IMPORTANT — tax base per row: whatever "amount" you record for a row is the ONLY
@@ -591,11 +598,20 @@ def build_unified_table(final):
     rows = []
     for p in parsed:
         it = p["it"]
+        disc_amt = it.get("discount_amount")
+        disc_pct = it.get("discount_percent")
+        if not is_empty(disc_amt):
+            discount_display = disc_amt
+        elif not is_empty(disc_pct):
+            discount_display = f"{disc_pct}%"
+        else:
+            discount_display = ""
         row = {
             "Item": it.get("description"),
             "HSN": it.get("hsn_sac_code"),
             "Qty": it.get("quantity"),
             "Unit Price": it.get("unit_price"),
+            "Discount": discount_display,
             "Amount": it.get("amount"),
             "IGST %": p["igst_pct"] if not is_empty(p["igst_pct"]) else "",
             "IGST Amt": p["igst_amt"] if not is_empty(p["igst_amt"]) else "",
@@ -747,7 +763,7 @@ if uploaded_files:
         if unified_rows:
             import pandas as pd
             st.markdown("**📦 Items & Tax**")
-            col_order = ["Item", "HSN", "Qty", "Unit Price", "Amount",
+            col_order = ["Item", "HSN", "Qty", "Unit Price", "Discount", "Amount",
                          "IGST %", "IGST Amt", "CGST %", "CGST Amt", "SGST %", "SGST Amt",
                          "Total Amt"]
             df = pd.DataFrame(unified_rows)

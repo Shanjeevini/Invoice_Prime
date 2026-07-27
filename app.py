@@ -461,70 +461,126 @@ def reconcile_invoice_totals(final):
 
 
 # ---------------------------------------------------------------------------
-# Single unified table: Item | HSN | Qty | Unit Price | IGST(%,Amt) |
+# Single unified table: Item | HSN | Qty | Unit Price | Amount | IGST(%,Amt) |
 # CGST(%,Amt) | SGST(%,Amt) | Total — one row per line item, one table per
-# invoice. Prefers tax figures printed directly on that row; if a row only
-# has a single generic tax figure and the invoice's tax type is known from
-# the invoice-level breakdown, that figure is placed in the matching
-# IGST/CGST-SGST column instead of duplicating extra tables.
+# invoice.
+#
+# Three passes, most-specific evidence first:
+#   1. Use whatever explicit CGST/SGST/IGST split is printed directly on
+#      that row.
+#   2. Use the row's own generic tax_rate_percent/tax_amount (or a tax
+#      implied by that row's own printed total minus its own amount),
+#      routed to whichever tax type the invoice actually uses.
+#   3. For rows that still show NO tax signal at all, check whether the
+#      invoice-level tax rate + amount arithmetically implies a taxable
+#      base that matches exactly one of these otherwise-untaxed rows'
+#      amount. If so, assign the tax there — this is deterministic
+#      arithmetic on numbers already printed, not a guess. If no unique
+#      match exists, the row is left untaxed and the totals reconciliation
+#      will flag the invoice for review instead of silently misallocating.
 # ---------------------------------------------------------------------------
+def _find_unique_amount_match(candidates, target_amount, rate):
+    if target_amount is None or not rate:
+        return None
+    implied_base = target_amount / (rate / 100)
+    matches = [c for c in candidates
+               if c["item_amt"] is not None and abs(c["item_amt"] - implied_base) <= TALLY_TOLERANCE]
+    return matches[0] if len(matches) == 1 else None
+
+
 def build_unified_table(final):
     items = final.get("items") or []
     gst = final.get("gst_breakdown") or {}
     cgst_b, sgst_b, igst_b = gst.get("CGST"), gst.get("SGST"), gst.get("IGST")
 
-    rows = []
+    parsed = []
     for it in items:
+        igst_pct, igst_amt = it.get("igst_rate_percent"), it.get("igst_amount")
+        cgst_pct, cgst_amt = it.get("cgst_rate_percent"), it.get("cgst_amount")
+        sgst_pct, sgst_amt = it.get("sgst_rate_percent"), it.get("sgst_amount")
+        gen_rate, gen_amt = it.get("tax_rate_percent"), it.get("tax_amount")
+        item_amt = _to_float(it.get("amount"))
+        item_total = _to_float(it.get("total_amount"))
+
+        if is_empty(gen_amt) and is_empty(gen_rate) and item_total is not None and item_amt is not None:
+            implied = round(item_total - item_amt, 2)
+            if implied > TALLY_TOLERANCE:
+                gen_amt = implied
+
+        has_explicit_split = not (is_empty(igst_amt) and is_empty(cgst_amt) and is_empty(sgst_amt))
+        has_row_signal = has_explicit_split or (not is_empty(gen_rate)) or (not is_empty(gen_amt))
+
+        parsed.append({
+            "it": it, "item_amt": item_amt,
+            "igst_pct": igst_pct, "igst_amt": igst_amt,
+            "cgst_pct": cgst_pct, "cgst_amt": cgst_amt,
+            "sgst_pct": sgst_pct, "sgst_amt": sgst_amt,
+            "gen_rate": gen_rate, "gen_amt": gen_amt,
+            "has_explicit_split": has_explicit_split, "has_row_signal": has_row_signal,
+        })
+
+    # Pass 2 — route each row's own generic tax figure into the right columns.
+    for p in parsed:
+        if p["has_explicit_split"] or not p["has_row_signal"]:
+            continue
+        gen_rate, gen_amt, item_amt = p["gen_rate"], p["gen_amt"], p["item_amt"]
+        if igst_b and not cgst_b and not sgst_b:
+            p["igst_pct"] = gen_rate if not is_empty(gen_rate) else igst_b.get("rate")
+            if not is_empty(gen_amt):
+                p["igst_amt"] = gen_amt
+            elif item_amt is not None and not is_empty(p["igst_pct"]):
+                p["igst_amt"] = round(item_amt * _to_float(p["igst_pct"]) / 100, 2)
+        elif cgst_b or sgst_b:
+            half_rate = _to_float(gen_rate) / 2 if not is_empty(gen_rate) else None
+            p["cgst_pct"] = half_rate if half_rate is not None else (cgst_b or {}).get("rate")
+            p["sgst_pct"] = half_rate if half_rate is not None else (sgst_b or {}).get("rate")
+            if not is_empty(gen_amt):
+                p["cgst_amt"] = round(_to_float(gen_amt) / 2, 2)
+                p["sgst_amt"] = round(_to_float(gen_amt) / 2, 2)
+            elif item_amt is not None and not is_empty(p["cgst_pct"]):
+                p["cgst_amt"] = round(item_amt * _to_float(p["cgst_pct"]) / 100, 2)
+                p["sgst_amt"] = round(item_amt * _to_float(p["sgst_pct"]) / 100, 2)
+
+    # Pass 3 — unique amount-match for rows with zero tax signal so far.
+    undetermined = [p for p in parsed if not p["has_row_signal"]]
+    if undetermined:
+        if igst_b and not cgst_b and not sgst_b:
+            target, rate = _to_float(igst_b.get("amount")), _to_float(igst_b.get("rate"))
+            match = _find_unique_amount_match(undetermined, target, rate)
+            if match:
+                match["igst_pct"], match["igst_amt"] = igst_b.get("rate"), igst_b.get("amount")
+        elif cgst_b or sgst_b:
+            c_amt, s_amt = _to_float((cgst_b or {}).get("amount")) or 0, _to_float((sgst_b or {}).get("amount")) or 0
+            c_rate, s_rate = _to_float((cgst_b or {}).get("rate")) or 0, _to_float((sgst_b or {}).get("rate")) or 0
+            target = round(c_amt + s_amt, 2) if (cgst_b or sgst_b) else None
+            rate = round(c_rate + s_rate, 2) if (c_rate or s_rate) else None
+            match = _find_unique_amount_match(undetermined, target, rate)
+            if match:
+                match["cgst_pct"], match["cgst_amt"] = (cgst_b or {}).get("rate"), (cgst_b or {}).get("amount")
+                match["sgst_pct"], match["sgst_amt"] = (sgst_b or {}).get("rate"), (sgst_b or {}).get("amount")
+
+    rows = []
+    for p in parsed:
+        it = p["it"]
         row = {
             "Item": it.get("description"),
             "HSN": it.get("hsn_sac_code"),
             "Qty": it.get("quantity"),
             "Unit Price": it.get("unit_price"),
+            "Amount": it.get("amount"),
+            "IGST %": p["igst_pct"] if not is_empty(p["igst_pct"]) else "",
+            "IGST Amt": p["igst_amt"] if not is_empty(p["igst_amt"]) else "",
+            "CGST %": p["cgst_pct"] if not is_empty(p["cgst_pct"]) else "",
+            "CGST Amt": p["cgst_amt"] if not is_empty(p["cgst_amt"]) else "",
+            "SGST %": p["sgst_pct"] if not is_empty(p["sgst_pct"]) else "",
+            "SGST Amt": p["sgst_amt"] if not is_empty(p["sgst_amt"]) else "",
         }
-
-        igst_pct, igst_amt = it.get("igst_rate_percent"), it.get("igst_amount")
-        cgst_pct, cgst_amt = it.get("cgst_rate_percent"), it.get("cgst_amount")
-        sgst_pct, sgst_amt = it.get("sgst_rate_percent"), it.get("sgst_amount")
-
-        # Row has no explicit per-item split — fall back to the row's own
-        # generic tax_rate_percent/tax_amount, routed to whichever tax type
-        # this invoice actually uses (from the invoice-level breakdown).
-        if is_empty(igst_amt) and is_empty(cgst_amt) and is_empty(sgst_amt):
-            gen_rate = it.get("tax_rate_percent")
-            gen_amt = it.get("tax_amount")
-            item_amt = _to_float(it.get("amount"))
-
-            if igst_b and not cgst_b and not sgst_b:
-                igst_pct = gen_rate if not is_empty(gen_rate) else igst_b.get("rate")
-                if not is_empty(gen_amt):
-                    igst_amt = gen_amt
-                elif item_amt is not None and not is_empty(igst_pct):
-                    igst_amt = round(item_amt * _to_float(igst_pct) / 100, 2)
-            elif cgst_b or sgst_b:
-                half_rate = _to_float(gen_rate) / 2 if not is_empty(gen_rate) else None
-                cgst_pct = half_rate if half_rate is not None else (cgst_b or {}).get("rate")
-                sgst_pct = half_rate if half_rate is not None else (sgst_b or {}).get("rate")
-                if not is_empty(gen_amt):
-                    cgst_amt = round(_to_float(gen_amt) / 2, 2)
-                    sgst_amt = round(_to_float(gen_amt) / 2, 2)
-                elif item_amt is not None and not is_empty(cgst_pct):
-                    cgst_amt = round(item_amt * _to_float(cgst_pct) / 100, 2)
-                    sgst_amt = round(item_amt * _to_float(sgst_pct) / 100, 2)
-
-        row["IGST %"] = igst_pct if not is_empty(igst_pct) else ""
-        row["IGST Amt"] = igst_amt if not is_empty(igst_amt) else ""
-        row["CGST %"] = cgst_pct if not is_empty(cgst_pct) else ""
-        row["CGST Amt"] = cgst_amt if not is_empty(cgst_amt) else ""
-        row["SGST %"] = sgst_pct if not is_empty(sgst_pct) else ""
-        row["SGST Amt"] = sgst_amt if not is_empty(sgst_amt) else ""
-
         total_amt = it.get("total_amount")
         if is_empty(total_amt):
-            item_amt = _to_float(it.get("amount"))
-            tax_sum = sum(v for v in [_to_float(igst_amt), _to_float(cgst_amt), _to_float(sgst_amt)] if v)
-            total_amt = round(item_amt + tax_sum, 2) if item_amt is not None else ""
+            tax_sum = sum(v for v in [_to_float(p["igst_amt"]), _to_float(p["cgst_amt"]), _to_float(p["sgst_amt"])]
+                          if v)
+            total_amt = round(p["item_amt"] + tax_sum, 2) if p["item_amt"] is not None else ""
         row["Total Amt"] = total_amt
-
         rows.append(row)
 
     return rows
@@ -662,7 +718,7 @@ if uploaded_files:
         if unified_rows:
             import pandas as pd
             st.markdown("**📦 Items & Tax**")
-            col_order = ["Item", "HSN", "Qty", "Unit Price",
+            col_order = ["Item", "HSN", "Qty", "Unit Price", "Amount",
                          "IGST %", "IGST Amt", "CGST %", "CGST Amt", "SGST %", "SGST Amt",
                          "Total Amt"]
             df = pd.DataFrame(unified_rows)

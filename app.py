@@ -190,11 +190,21 @@ column position, different invoices order columns differently.
   the table only has ONE total-like column with no separate pre/post-tax split,
   use that single column here instead (don't invent a taxable-amount split that
   doesn't exist).
+- CRITICAL — do not confuse a post-tax "Amount" with a pre-tax one: if the row
+  ALSO has its own tax/GST column (showing a rate and/or tax currency amount,
+  e.g. "282.20 (18%)"), then a single remaining money column is almost always
+  the row's POST-tax total, not the pre-tax amount — because the tax has
+  already been broken out separately. In that case: put that money-column
+  value in total_amount (not amount), and compute amount as (unit_price ×
+  quantity) if both are printed on the row; if unit_price/quantity aren't
+  available, compute amount as total_amount minus the row's own tax_amount.
+  Never place the same post-tax figure into both amount and total_amount —
+  that causes tax to be calculated twice on the same value downstream.
 - "total_amount" (item-level, optional) = ONLY fill this if the SAME row also
   prints its own separate GRAND TOTAL column (i.e. the row shows two distinct
   numbers: a pre-tax amount AND a separate post-tax total, e.g. "Taxable
-  Amount" next to "Total"). If the row only has one total-like figure, leave
-  this null — don't duplicate "amount" into it.
+  Amount" next to "Total") — see the rule above for the case where the row's
+  own tax column makes clear that the sole remaining figure is post-tax.
 - Tax per row: if the row shows a tax RATE (e.g. "GST% = 5.00"), put that number
   in tax_rate_percent. If the row shows a tax AMOUNT in currency directly, put
   that in tax_amount. If the row instead prints BOTH a pre-tax amount and a
@@ -631,6 +641,48 @@ def build_unified_table(final):
     return rows
 
 
+def fix_pretax_amount(item):
+    """
+    Some invoices print a line-item table where the only per-row money
+    column besides unit price is the row's POST-tax total (with tax shown
+    separately, e.g. a "GST" column like "282.20 (18%)") — not a pre-tax
+    "Amount". If the model put that post-tax figure into `amount`, every
+    downstream tax calc double-counts the tax. Detect this by checking
+    unit_price × quantity against `amount`: if they don't match, but
+    `amount` DOES match (unit_price × quantity) grossed up by the row's own
+    tax rate, `amount` was actually the total — fix it deterministically
+    from numbers already on the row, no external data needed.
+    """
+    unit_price = _to_float(item.get("unit_price"))
+    qty = _to_float(item.get("quantity"))
+    amt = _to_float(item.get("amount"))
+    rate = _to_float(item.get("tax_rate_percent"))
+    tax_amt = _to_float(item.get("tax_amount"))
+    existing_total = _to_float(item.get("total_amount"))
+
+    if unit_price is None or qty is None or amt is None:
+        return item
+
+    expected_base = round(unit_price * qty, 2)
+    if abs(amt - expected_base) <= TALLY_TOLERANCE:
+        return item  # amount already matches the pre-tax base — nothing to fix
+
+    expected_posttax = None
+    if rate is not None:
+        expected_posttax = round(expected_base * (1 + rate / 100), 2)
+    elif tax_amt is not None:
+        expected_posttax = round(expected_base + tax_amt, 2)
+
+    if expected_posttax is not None and abs(amt - expected_posttax) <= TALLY_TOLERANCE:
+        if existing_total is None:
+            item["total_amount"] = item["amount"]  # preserve the printed post-tax total
+        item["amount"] = str(expected_base)
+        if is_empty(item.get("tax_amount")):
+            item["tax_amount"] = str(round(expected_posttax - expected_base, 2))
+
+    return item
+
+
 def postprocess(data):
     final = {k: v for k, v in data.items() if k != "items"}
 
@@ -662,6 +714,7 @@ def postprocess(data):
         item_hsn = item.get("hsn_sac_code")
         if item_hsn and not re.match(r'^\d{4,8}$', str(item_hsn)):
             item["hsn_sac_code"] = None
+        item = fix_pretax_amount(item)
         cleaned_items.append(item)
     final["items"] = cleaned_items
 

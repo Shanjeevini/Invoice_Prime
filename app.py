@@ -533,6 +533,40 @@ def _find_unique_amount_match(candidates, target_amount, rate):
     return matches[0] if len(matches) == 1 else None
 
 
+def _distribute_group_tax(candidates, target_amount, rate):
+    """
+    Some invoices tax the COMBINED total of several/all line items at one
+    flat rate (e.g. "Taxable Value: 404.68 / IGST@18%: 72.84" covering three
+    separate item rows, none of which alone equals 404.68). If the sum of
+    every still-undetermined row's amount matches the base that rate+amount
+    implies, split the printed tax across them proportionally by amount
+    share — rounding the last row so the total ties out exactly to the
+    printed figure rather than drifting from per-row rounding.
+    """
+    if target_amount is None or not rate:
+        return None
+    usable = [c for c in candidates if c["item_amt"] is not None]
+    if not usable:
+        return None
+    total_base = sum(c["item_amt"] for c in usable)
+    if total_base <= 0:
+        return None
+    implied_base = target_amount / (rate / 100)
+    if abs(total_base - implied_base) > TALLY_TOLERANCE:
+        return None
+
+    allocations = []
+    running = 0.0
+    for i, c in enumerate(usable):
+        if i == len(usable) - 1:
+            share = round(target_amount - running, 2)
+        else:
+            share = round(target_amount * (c["item_amt"] / total_base), 2)
+            running += share
+        allocations.append((c, share))
+    return allocations
+
+
 def build_unified_table(final):
     items = final.get("items") or []
     gst = final.get("gst_breakdown") or {}
@@ -594,6 +628,7 @@ def build_unified_table(final):
             match = _find_unique_amount_match(undetermined, target, rate)
             if match:
                 match["igst_pct"], match["igst_amt"] = igst_b.get("rate"), igst_b.get("amount")
+                match["has_row_signal"] = True
         elif cgst_b or sgst_b:
             c_amt, s_amt = _to_float((cgst_b or {}).get("amount")) or 0, _to_float((sgst_b or {}).get("amount")) or 0
             c_rate, s_rate = _to_float((cgst_b or {}).get("rate")) or 0, _to_float((sgst_b or {}).get("rate")) or 0
@@ -603,6 +638,35 @@ def build_unified_table(final):
             if match:
                 match["cgst_pct"], match["cgst_amt"] = (cgst_b or {}).get("rate"), (cgst_b or {}).get("amount")
                 match["sgst_pct"], match["sgst_amt"] = (sgst_b or {}).get("rate"), (sgst_b or {}).get("amount")
+                match["has_row_signal"] = True
+
+    # Pass 4 — group distribution: the invoice's tax may cover the COMBINED
+    # total of every row still undetermined (rather than any single row).
+    # Only fires when the group's summed amount matches what the printed
+    # rate + tax amount implies — deterministic arithmetic, not a guess.
+    still_undetermined = [p for p in parsed if not p["has_row_signal"]]
+    if len(still_undetermined) > 1:
+        if igst_b and not cgst_b and not sgst_b:
+            target, rate = _to_float(igst_b.get("amount")), _to_float(igst_b.get("rate"))
+            allocations = _distribute_group_tax(still_undetermined, target, rate)
+            if allocations:
+                for c, share in allocations:
+                    c["igst_pct"], c["igst_amt"] = igst_b.get("rate"), share
+                    c["has_row_signal"] = True
+        elif cgst_b or sgst_b:
+            c_amt, s_amt = _to_float((cgst_b or {}).get("amount")) or 0, _to_float((sgst_b or {}).get("amount")) or 0
+            c_rate, s_rate = _to_float((cgst_b or {}).get("rate")) or 0, _to_float((sgst_b or {}).get("rate")) or 0
+            target = round(c_amt + s_amt, 2) if (cgst_b or sgst_b) else None
+            rate = round(c_rate + s_rate, 2) if (c_rate or s_rate) else None
+            allocations = _distribute_group_tax(still_undetermined, target, rate)
+            if allocations:
+                cgst_share_rate = (c_rate / rate) if rate else 0.5
+                for c, share in allocations:
+                    c["cgst_pct"] = (cgst_b or {}).get("rate")
+                    c["sgst_pct"] = (sgst_b or {}).get("rate")
+                    c["cgst_amt"] = round(share * cgst_share_rate, 2)
+                    c["sgst_amt"] = round(share - c["cgst_amt"], 2)
+                    c["has_row_signal"] = True
 
     rows = []
     for p in parsed:
@@ -858,7 +922,14 @@ if uploaded_files:
         if final_result.get("needs_human_review"):
             st.error("🚨 NEEDS HUMAN REVIEW\n\n" + "\n\n".join(f"- {r}" for r in final_result["review_reasons"]))
         elif recon:
+            leftover = recon["difference"]
+            if abs(leftover) > 0.005:
+                # A small gap remains (within tolerance) that no printed
+                # adjustment already accounts for — surface it explicitly
+                # rather than silently treating it as "close enough".
+                st.write(f"**Round Off (implied, not separately printed):** {leftover:+.2f}")
             st.success("Totals tally correctly.")
+
 
         with st.expander("📋 Full JSON Output"):
             st.json(final_result)

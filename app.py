@@ -457,24 +457,21 @@ def reconcile_invoice_totals(final):
     adjustments = final.get("adjustments") or []
     adjustments_sum = sum((_to_float(a.get("amount")) or 0.0) for a in adjustments if isinstance(a, dict))
 
-    # Primary check: sum each line item's own total_amount. This is the most
-    # trustworthy path because it's grounded in per-row numbers that have
-    # already been validated/corrected (see fix_pretax_amount) — unlike the
-    # top-level "subtotal" field, which some invoices mislabel or print as
-    # already tax-inclusive (e.g. a "Sub Total" box that equals "Total").
-    # Only fall back to subtotal-based math when there's no usable item data.
-    items = final.get("items") or []
+    # Primary check: sum "Total Amt" from the unified table — this is the
+    # single source of truth for what each row actually totals to (it
+    # already accounts for CGST/SGST/IGST splits, per-item pretax fixes,
+    # etc.). Recomputing totals separately here with a simpler formula
+    # would silently ignore tax stored in cgst_amount/sgst_amount/
+    # igst_amount rather than the generic tax_amount field, understating
+    # the total. Only fall back to subtotal-based math when there's no
+    # usable item data at all.
+    unified_rows = final.get("unified_table") or []
     items_total = 0.0
     any_item_data = False
-    for it in items:
-        amt = _to_float(it.get("amount"))
-        tax_amt = _to_float(it.get("tax_amount"))
-        item_total = _to_float(it.get("total_amount"))
-        if item_total is not None:
-            items_total += item_total
-            any_item_data = True
-        elif amt is not None:
-            items_total += amt + (tax_amt or 0.0)
+    for row in unified_rows:
+        t = _to_float(row.get("Total Amt"))
+        if t is not None:
+            items_total += t
             any_item_data = True
 
     if any_item_data:

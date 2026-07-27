@@ -78,6 +78,13 @@ class TaxLine(BaseModel):
     amount: Optional[str] = None
 
 
+class AdjustmentLine(BaseModel):
+    label: Optional[str] = None
+    # Signed as printed: "-0.40" for a deduction (e.g. round off down),
+    # "50.00" for an addition (e.g. freight, packing charges).
+    amount: Optional[str] = None
+
+
 class HsnSummaryLine(BaseModel):
     hsn_code: Optional[str] = None
     quantity: Optional[str] = None
@@ -141,6 +148,10 @@ class InvoiceData(BaseModel):
     invoice_discount_amount: Optional[str] = None
     taxes: List[TaxLine] = []
     hsn_summary: List[HsnSummaryLine] = []
+    # Any OTHER named line in the totals box that is neither a tax nor the
+    # invoice_discount fields above — e.g. "Round Off", "Freight Charges",
+    # "Packing & Forwarding", "Insurance", "Other Charges". Signed amounts.
+    adjustments: List[AdjustmentLine] = []
     total_tax: Optional[str] = None
     total_amount: Optional[str] = None
     amount_in_words: Optional[str] = None
@@ -253,6 +264,20 @@ actually has (it may show IGST instead of CGST/SGST, or a single combined tax am
 instead — only fill what's printed). Most invoices do NOT have this second table —
 in that case leave hsn_summary as an empty list. Do not construct one yourself by
 grouping the line items — only extract it if it's a table that's actually printed.
+
+ADJUSTMENTS (round off, freight, other named charges): the totals/summary box may print
+one or more additional named lines that are neither a tax nor the overall discount —
+common examples: "Round Off" / "Rounding" (often small, ±1 or less, sometimes shown as
+"Less: Rounded Off (-)0.40"), "Freight Charges", "Packing & Forwarding", "Insurance",
+"Shipping", "Other Charges", "Handling Fee". For each such line actually printed,
+add one entry to "adjustments" with the label exactly as printed and the amount signed
+to match: NEGATIVE if the invoice shows it as a deduction (e.g. printed with "(-)", a
+minus sign, in parentheses, or under a "Less:" heading), POSITIVE if it's added to the
+total (e.g. under an "Add:" heading, or a charge line with no minus sign). Do not put
+the overall invoice-level percentage/amount discount here — that belongs in
+invoice_discount_percent / invoice_discount_amount instead. Do not put tax lines here —
+those belong in "taxes". Most invoices have no such lines — leave adjustments as an
+empty list in that case; never invent a round-off value that isn't printed.
 
 FIELD RULES:
 - All numeric fields: plain strings, no currency symbols, no thousands separators.
@@ -424,9 +449,12 @@ def reconcile_invoice_totals(final):
         pct = _to_float(final.get("invoice_discount_percent"))
         discount = round(subtotal * pct / 100, 2) if pct is not None else None
 
+    adjustments = final.get("adjustments") or []
+    adjustments_sum = sum((_to_float(a.get("amount")) or 0.0) for a in adjustments if isinstance(a, dict))
+
     if subtotal is not None and effective_tax is not None:
-        expected_total = round(subtotal - (discount or 0.0) + effective_tax, 2)
-        basis = "subtotal − discount + tax"
+        expected_total = round(subtotal - (discount or 0.0) + effective_tax + adjustments_sum, 2)
+        basis = "subtotal − discount + tax + adjustments" if adjustments else "subtotal − discount + tax"
     else:
         # Fall back to summing each line item's own total — this is what
         # correctly handles invoices where tax only applies to some rows
@@ -447,8 +475,9 @@ def reconcile_invoice_totals(final):
                 any_item_data = True
         if not any_item_data:
             return None
-        expected_total = round(items_total, 2)
-        basis = "sum of each line item's own total (tax applied per-row)"
+        expected_total = round(items_total + adjustments_sum, 2)
+        basis = ("sum of each line item's own total + adjustments" if adjustments
+                  else "sum of each line item's own total (tax applied per-row)")
 
     diff = round(total_amount - expected_total, 2)
     return {
@@ -736,6 +765,19 @@ if uploaded_files:
             val = final_result.get(field)
             if not is_empty(val):
                 amt_cols[idx % 3].write(f"**{field.replace('_', ' ').title()}:** {val}")
+
+        # ---------------- Adjustments: round off, freight, other charges ----------------
+        adjustments = final_result.get("adjustments") or []
+        if adjustments:
+            st.markdown("**➕➖ Other Charges / Adjustments** *(as printed on the invoice)*")
+            for adj in adjustments:
+                label = adj.get("label") or "Adjustment"
+                amount = adj.get("amount")
+                if is_empty(amount):
+                    continue
+                amt_val = _to_float(amount)
+                sign = "+" if (amt_val is not None and amt_val > 0) else ""
+                st.write(f"**{label}:** {sign}{amount}")
 
         # ---------------- Combined reconciliation status ----------------
         recon = final_result.get("total_reconciliation")

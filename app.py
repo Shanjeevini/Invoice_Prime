@@ -98,6 +98,16 @@ class InvoiceItem(BaseModel):
     amount: Optional[str] = None
     tax_rate_percent: Optional[str] = None
     tax_amount: Optional[str] = None
+    # Only filled when THIS row explicitly prints a CGST/SGST/IGST split of
+    # its own (e.g. "OUTPUT CGST 9%" / "OUTPUT SGST 9%" against this exact
+    # row). Leave null when the row only shows one combined tax figure —
+    # that case stays in tax_rate_percent / tax_amount above.
+    igst_rate_percent: Optional[str] = None
+    igst_amount: Optional[str] = None
+    cgst_rate_percent: Optional[str] = None
+    cgst_amount: Optional[str] = None
+    sgst_rate_percent: Optional[str] = None
+    sgst_amount: Optional[str] = None
     total_amount: Optional[str] = None
 
 
@@ -183,6 +193,16 @@ column position, different invoices order columns differently.
   null rather than guessing. Most invoices do NOT break tax into separate lines
   per row (that split, if present at all, is usually only in an invoice-level
   summary box, which belongs in the top-level "taxes" list instead, not per item).
+- Per-item CGST/SGST/IGST: if — and only if — THIS SPECIFIC row (or the block of
+  text directly under this item) explicitly prints its own CGST/SGST/IGST split
+  (e.g. "OUTPUT CGST 9%" and "OUTPUT SGST 9%" listed right under one item), fill
+  igst_rate_percent/igst_amount, cgst_rate_percent/cgst_amount, and
+  sgst_rate_percent/sgst_amount from those exact printed figures for that row.
+  Leave whichever of the three types isn't printed as null (e.g. IGST fields stay
+  null on a row that only shows CGST+SGST). If the row does NOT show its own
+  CGST/SGST/IGST split and only has a single generic tax_rate_percent/tax_amount
+  (or no per-row tax at all), leave all six of these fields null — do not copy the
+  generic tax_rate_percent/tax_amount into them.
 - If a discount is shown only ONCE for the whole invoice (e.g. "Discount 17%" in a
   totals/summary box, not repeated per row), that belongs in the top-level
   invoice_discount_percent / invoice_discount_amount instead — leave every item's
@@ -440,6 +460,76 @@ def reconcile_invoice_totals(final):
     }
 
 
+# ---------------------------------------------------------------------------
+# Single unified table: Item | HSN | Qty | Unit Price | IGST(%,Amt) |
+# CGST(%,Amt) | SGST(%,Amt) | Total — one row per line item, one table per
+# invoice. Prefers tax figures printed directly on that row; if a row only
+# has a single generic tax figure and the invoice's tax type is known from
+# the invoice-level breakdown, that figure is placed in the matching
+# IGST/CGST-SGST column instead of duplicating extra tables.
+# ---------------------------------------------------------------------------
+def build_unified_table(final):
+    items = final.get("items") or []
+    gst = final.get("gst_breakdown") or {}
+    cgst_b, sgst_b, igst_b = gst.get("CGST"), gst.get("SGST"), gst.get("IGST")
+
+    rows = []
+    for it in items:
+        row = {
+            "Item": it.get("description"),
+            "HSN": it.get("hsn_sac_code"),
+            "Qty": it.get("quantity"),
+            "Unit Price": it.get("unit_price"),
+        }
+
+        igst_pct, igst_amt = it.get("igst_rate_percent"), it.get("igst_amount")
+        cgst_pct, cgst_amt = it.get("cgst_rate_percent"), it.get("cgst_amount")
+        sgst_pct, sgst_amt = it.get("sgst_rate_percent"), it.get("sgst_amount")
+
+        # Row has no explicit per-item split — fall back to the row's own
+        # generic tax_rate_percent/tax_amount, routed to whichever tax type
+        # this invoice actually uses (from the invoice-level breakdown).
+        if is_empty(igst_amt) and is_empty(cgst_amt) and is_empty(sgst_amt):
+            gen_rate = it.get("tax_rate_percent")
+            gen_amt = it.get("tax_amount")
+            item_amt = _to_float(it.get("amount"))
+
+            if igst_b and not cgst_b and not sgst_b:
+                igst_pct = gen_rate if not is_empty(gen_rate) else igst_b.get("rate")
+                if not is_empty(gen_amt):
+                    igst_amt = gen_amt
+                elif item_amt is not None and not is_empty(igst_pct):
+                    igst_amt = round(item_amt * _to_float(igst_pct) / 100, 2)
+            elif cgst_b or sgst_b:
+                half_rate = _to_float(gen_rate) / 2 if not is_empty(gen_rate) else None
+                cgst_pct = half_rate if half_rate is not None else (cgst_b or {}).get("rate")
+                sgst_pct = half_rate if half_rate is not None else (sgst_b or {}).get("rate")
+                if not is_empty(gen_amt):
+                    cgst_amt = round(_to_float(gen_amt) / 2, 2)
+                    sgst_amt = round(_to_float(gen_amt) / 2, 2)
+                elif item_amt is not None and not is_empty(cgst_pct):
+                    cgst_amt = round(item_amt * _to_float(cgst_pct) / 100, 2)
+                    sgst_amt = round(item_amt * _to_float(sgst_pct) / 100, 2)
+
+        row["IGST %"] = igst_pct if not is_empty(igst_pct) else ""
+        row["IGST Amt"] = igst_amt if not is_empty(igst_amt) else ""
+        row["CGST %"] = cgst_pct if not is_empty(cgst_pct) else ""
+        row["CGST Amt"] = cgst_amt if not is_empty(cgst_amt) else ""
+        row["SGST %"] = sgst_pct if not is_empty(sgst_pct) else ""
+        row["SGST Amt"] = sgst_amt if not is_empty(sgst_amt) else ""
+
+        total_amt = it.get("total_amount")
+        if is_empty(total_amt):
+            item_amt = _to_float(it.get("amount"))
+            tax_sum = sum(v for v in [_to_float(igst_amt), _to_float(cgst_amt), _to_float(sgst_amt)] if v)
+            total_amt = round(item_amt + tax_sum, 2) if item_amt is not None else ""
+        row["Total Amt"] = total_amt
+
+        rows.append(row)
+
+    return rows
+
+
 def postprocess(data):
     final = {k: v for k, v in data.items() if k != "items"}
 
@@ -482,8 +572,25 @@ def postprocess(data):
     gst_buckets, other_taxes = classify_gst(final.get("taxes"))
     final["gst_breakdown"] = {"CGST": gst_buckets["CGST"], "SGST": gst_buckets["SGST"],
                                "IGST": gst_buckets["IGST"], "other_taxes": other_taxes}
-    final["hsn_reconciliation"] = match_items_to_hsn(cleaned_items, final.get("hsn_summary"))
-    final["total_reconciliation"] = reconcile_invoice_totals(final)
+    final["unified_table"] = build_unified_table(final)
+    hsn_recon = match_items_to_hsn(cleaned_items, final.get("hsn_summary"))
+    total_recon = reconcile_invoice_totals(final)
+    final["total_reconciliation"] = total_recon
+    final["hsn_reconciliation_detail"] = hsn_recon
+
+    # One combined review flag covering both checks, so the UI only needs a
+    # single status line instead of separate tables/boxes for each.
+    review_reasons = []
+    if total_recon and total_recon["needs_review"]:
+        review_reasons.append(
+            f"total amount off by {total_recon['difference']:+.2f} "
+            f"(expected {total_recon['expected_total']} vs printed {total_recon['printed_total']})"
+        )
+    for row in hsn_recon:
+        if "Mismatch" in row.get("status", "") or "No matching" in row.get("status", ""):
+            review_reasons.append(f"HSN {row.get('hsn_code')}: {row.get('status')}")
+    final["needs_human_review"] = bool(review_reasons)
+    final["review_reasons"] = review_reasons
 
     return final
 
@@ -550,19 +657,19 @@ if uploaded_files:
             if not is_empty(val):
                 inv_cols[idx % 3].write(f"**{field.replace('_', ' ').title()}:** {val}")
 
-        if final_result.get("items"):
-            st.markdown("**📦 Line Items**")
+        # ---------------- Single unified item + tax table ----------------
+        unified_rows = final_result.get("unified_table") or []
+        if unified_rows:
             import pandas as pd
-            items = final_result["items"]
-            preferred_cols = ["sl_no", "description", "hsn_sac_code", "quantity",
-                               "unit_price", "discount_amount", "amount",
-                               "tax_rate_percent", "tax_amount", "total_amount"]
-            df = pd.DataFrame(items)
-            ordered = [c for c in preferred_cols if c in df.columns]
-            df = df[ordered + [c for c in df.columns if c not in ordered]]
+            st.markdown("**📦 Items & Tax**")
+            col_order = ["Item", "HSN", "Qty", "Unit Price",
+                         "IGST %", "IGST Amt", "CGST %", "CGST Amt", "SGST %", "SGST Amt",
+                         "Total Amt"]
+            df = pd.DataFrame(unified_rows)
+            df = df[[c for c in col_order if c in df.columns]]
             df = df.fillna("").replace("null", "").replace("None", "")
             st.dataframe(df, use_container_width=True, hide_index=True)
-            st.caption(f"Total items extracted: **{len(items)}**")
+            st.caption(f"Total items: **{len(unified_rows)}**")
 
         st.markdown("**💰 Amounts**")
         amt_cols = st.columns(3)
@@ -574,71 +681,18 @@ if uploaded_files:
             if not is_empty(val):
                 amt_cols[idx % 3].write(f"**{field.replace('_', ' ').title()}:** {val}")
 
-        # ---------------- Rule 1: CGST / SGST / IGST split ----------------
-        st.markdown("**🧮 Tax Breakdown — CGST / SGST / IGST**")
-        gst = final_result.get("gst_breakdown") or {}
-        gst_cols = st.columns(3)
-        for col, key in zip(gst_cols, ["CGST", "SGST", "IGST"]):
-            bucket = gst.get(key)
-            with col:
-                if bucket and not is_empty(bucket.get("amount")):
-                    rate_txt = f"{bucket['rate']}%" if not is_empty(bucket.get("rate")) else "rate not printed"
-                    st.metric(label=key, value=str(bucket["amount"]))
-                    st.caption(rate_txt)
-                else:
-                    st.metric(label=key, value="—")
-                    st.caption("not applicable on this invoice")
-
-        other_taxes = gst.get("other_taxes") or []
-        if other_taxes:
-            st.markdown("**Other Tax Lines** *(as printed — VAT, Cess, Service Tax, etc.)*")
-            other_cols = st.columns(3)
-            for idx, tax_line in enumerate(other_taxes):
-                label = tax_line.get("label") or "Tax"
-                rate = tax_line.get("rate_percent")
-                amount = tax_line.get("amount")
-                parts = []
-                if not is_empty(rate):
-                    parts.append(f"{rate}%")
-                if not is_empty(amount):
-                    parts.append(str(amount))
-                if parts:
-                    other_cols[idx % 3].write(f"**{label}:** {' / '.join(parts)}")
-
-        # ---------------- Rule 2: HSN summary + reconciliation ----------------
-        hsn_summary = final_result.get("hsn_summary") or []
-        if hsn_summary:
-            import pandas as pd
-            st.markdown("**📊 HSN-wise Summary** *(separate grouping table found on this invoice)*")
-            hsn_df = pd.DataFrame(hsn_summary)
-            hsn_df = hsn_df.fillna("").replace("null", "").replace("None", "")
-            st.dataframe(hsn_df, use_container_width=True, hide_index=True)
-
-            hsn_match = final_result.get("hsn_reconciliation") or []
-            if hsn_match:
-                st.markdown("**🔗 Line-item ↔ HSN Summary Match**")
-                match_df = pd.DataFrame(hsn_match)
-                st.dataframe(match_df, use_container_width=True, hide_index=True)
-                if any("Mismatch" in str(r.get("status", "")) or "No matching" in str(r.get("status", ""))
-                       for r in hsn_match):
-                    st.warning("⚠️ One or more HSN groups don't tally between the line-item table and "
-                               "the HSN summary table.")
-                    st.error("🚨 NEEDS HUMAN REVIEW")
-
-        # ---------------- Rule 3: Total reconciliation ----------------
+        # ---------------- Combined reconciliation status ----------------
         recon = final_result.get("total_reconciliation")
         if recon:
-            st.markdown("**✅ Total Amount Reconciliation**")
             st.write(
-                f"Basis: *{recon['basis']}*  \n"
-                f"Expected total: **{recon['expected_total']}**  |  "
-                f"Printed total: **{recon['printed_total']}**"
+                f"Total check ({recon['basis']}): expected **{recon['expected_total']}** "
+                f"vs printed **{recon['printed_total']}**"
             )
-            if recon["needs_review"]:
-                st.write(f"⚠️ Difference found: **{recon['difference']:+.2f}**")
-                st.error("🚨 NEEDS HUMAN REVIEW — totals do not tally within tolerance.")
-            else:
-                st.success("Totals tally correctly.")
+
+        if final_result.get("needs_human_review"):
+            st.error("🚨 NEEDS HUMAN REVIEW\n\n" + "\n\n".join(f"- {r}" for r in final_result["review_reasons"]))
+        elif recon:
+            st.success("Totals tally correctly.")
 
         with st.expander("📋 Full JSON Output"):
             st.json(final_result)

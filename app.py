@@ -258,24 +258,25 @@ column position, different invoices order columns differently.
   charged ONLY on the service-fee line and NOT on the fare line. Never assume tax
   applies uniformly across all rows; read each row's own printed tax figures only.
 
-INVOICE-LEVEL TAXES: do not force values into fixed CGST/SGST/IGST/VAT slots. Instead,
-list every distinct tax line actually printed in the invoice's totals/summary box as
-its own entry in "taxes", using the label exactly as printed (e.g. "CGST", "SGST",
-"IGST@18%", "VAT", "Service Tax", "GST") — one entry per line printed, in the order
-shown, with rate_percent and/or amount filled from whatever that line shows. If the
-invoice only prints one combined tax figure (no breakdown at all), that's a single
-entry with whatever label is printed (or "Tax" if truly unlabeled). If a single
-overall "Total Tax" figure is separately printed in addition to the breakdown, put
-that in the top-level total_tax field — otherwise leave total_tax null rather than
-computing it yourself by summing the taxes list.
-DO NOT DUPLICATE: if the totals box only prints ONE combined tax figure and nothing
-else — no distinct tax types broken out as their own separate lines — that single
-figure belongs ONLY in total_tax. Do not also create a one-entry "taxes" list
-repeating that same number under whatever label happened to be printed next to it
-(e.g. "GST %", "Tax", "GST"). A "taxes" entry is for when the invoice shows genuinely
-separate, distinctly-labeled tax lines side by side (e.g. CGST and SGST each printed
-as their own row) — a single combined figure is not a breakdown, so leave "taxes"
-empty in that case and rely on total_tax alone.
+INVOICE-LEVEL TAXES: for EVERY distinctly-labeled tax line printed in the invoice's
+totals/summary box — CGST, SGST, IGST, VAT, Service Tax, Cess, or any other
+specifically-named tax type — always add ONE entry per line to "taxes", using the
+label exactly as printed, with rate_percent and/or amount filled from whatever that
+line shows. ALWAYS do this even when it is the ONLY tax line on the invoice (e.g. the
+totals box shows only "IGST @ 5.00%" and nothing else) — never skip adding the entry
+just because there's a single line; the label is what identifies WHICH tax type it
+is (IGST vs CGST vs SGST vs VAT), and that identity must never be dropped, since
+downstream calculations depend on knowing which specific tax type applies.
+The ONLY case where a "taxes" entry should be skipped is when the totals box prints a
+tax figure with NO specific tax-type name at all — a truly generic, unlabeled row
+(e.g. just "Tax" or "GST %" with no CGST/SGST/IGST/VAT wording). In that narrow case
+only, put the number in total_tax and leave "taxes" empty, since there's no tax-type
+identity to preserve.
+If the invoice additionally prints one further OVERALL summary figure on top of the
+specific tax-type line(s) already captured in "taxes" (e.g. a separate "Total
+Tax"/"Total GST" footer distinct from the CGST/SGST/IGST rows themselves), put that
+extra figure in the top-level total_tax field. Otherwise leave total_tax null rather
+than computing it yourself by summing the taxes list.
 
 IMPORTANT — rate vs amount: judge by the actual NUMBER, not by the printed label text.
 Some invoices carry a row literally labeled "GST %" that actually holds a currency

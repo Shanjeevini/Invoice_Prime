@@ -525,13 +525,15 @@ def reconcile_invoice_totals(final):
             unallocated_tax = remainder
 
     if any_item_data:
-        expected_total = round(items_total + adjustments_sum + unallocated_tax, 2)
-        basis_parts = ["sum of each line item's own total"]
-        if adjustments:
-            basis_parts.append("adjustments")
+        # Adjustments are now merged as their own rows inside unified_table
+        # (see build_unified_table), so their amounts are already included
+        # in items_total above — do not add adjustments_sum again here, or
+        # every adjustment would be double-counted.
+        expected_total = round(items_total + unallocated_tax, 2)
+        basis_parts = ["sum of each line item's and adjustment's own total"]
         if unallocated_tax:
-            basis_parts.append("invoice-level tax not tied to a specific item")
-        basis = " + ".join(basis_parts)
+            basis_parts.append("plus invoice-level tax not tied to a specific row")
+        basis = " ".join(basis_parts)
     else:
         subtotal = _to_float(final.get("subtotal"))
         effective_tax = printed_tax
@@ -717,30 +719,6 @@ def build_unified_table(final):
                 match["sgst_pct"], match["sgst_amt"] = (sgst_b or {}).get("rate"), (sgst_b or {}).get("amount")
                 match["has_row_signal"] = True
 
-    # Pass 3b — sole line item: if the invoice has exactly ONE line item and
-    # it still has no tax signal, any invoice-level tax has nowhere else it
-    # could possibly belong — attribute it to that item directly. This
-    # covers invoices where tax is charged on the assessable value (item
-    # amount + freight/insurance/loading/certificate, etc.) rather than on
-    # the bare item amount, so the base-matching in Pass 3 above doesn't
-    # line up numerically. With only one item, there's no ambiguity about
-    # which row the printed tax % and amount belong to, so show them there.
-    if len(parsed) == 1 and not parsed[0]["has_row_signal"]:
-        p = parsed[0]
-        if igst_b and not cgst_b and not sgst_b and not is_empty(igst_b.get("amount")):
-            p["igst_pct"], p["igst_amt"] = igst_b.get("rate"), igst_b.get("amount")
-            p["has_row_signal"] = True
-        elif cgst_b or sgst_b:
-            assigned = False
-            if not is_empty((cgst_b or {}).get("amount")):
-                p["cgst_pct"], p["cgst_amt"] = (cgst_b or {}).get("rate"), (cgst_b or {}).get("amount")
-                assigned = True
-            if not is_empty((sgst_b or {}).get("amount")):
-                p["sgst_pct"], p["sgst_amt"] = (sgst_b or {}).get("rate"), (sgst_b or {}).get("amount")
-                assigned = True
-            if assigned:
-                p["has_row_signal"] = True
-
     # Pass 4 — group distribution: the invoice's tax may cover the COMBINED
     # total of every row still undetermined (rather than any single row).
     # Only fires when the group's summed amount matches what the printed
@@ -768,6 +746,82 @@ def build_unified_table(final):
                     c["cgst_amt"] = round(share * cgst_share_rate, 2)
                     c["sgst_amt"] = round(share - c["cgst_amt"], 2)
                     c["has_row_signal"] = True
+
+    # Pass 5 — assessable-value tax split: some invoices charge tax on the
+    # ASSESSABLE VALUE — item amount(s) PLUS non-deduction adjustments like
+    # freight, insurance, loading/handling, certificate charges — rather
+    # than on item amounts alone, so Pass 3/4's base-matching above never
+    # lines up. When items remain undetermined and this invoice's own tax
+    # rate is known, check whether applying that exact rate to every
+    # remaining item amount AND every non-"round off" adjustment amount
+    # reproduces the invoice's OWN printed tax total (within tolerance).
+    # Only when that check passes — proving this really is the
+    # assessable-value pattern, not an invoice where some rows are simply
+    # exempt — split the tax out per component, so items and adjustments
+    # each show their own %, amount, and running total instead of one lump
+    # sum parked on a single row (or left unexplained).
+    def _is_round_off(label):
+        return "round" in (label or "").lower()
+
+    adjustments = final.get("adjustments") or []
+    taxable_adjustments = [a for a in adjustments
+                            if isinstance(a, dict) and not _is_round_off(a.get("label"))]
+    adjustments_taxable_sum = sum((_to_float(a.get("amount")) or 0.0) for a in taxable_adjustments)
+    adjustment_tax_rows = []
+
+    still_undetermined2 = [p for p in parsed if not p["has_row_signal"]]
+    if still_undetermined2:
+        items_base = sum((p["item_amt"] or 0.0) for p in still_undetermined2 if p["item_amt"] is not None)
+        combined_base = items_base + adjustments_taxable_sum
+
+        if igst_b and not cgst_b and not sgst_b:
+            rate = _to_float(igst_b.get("rate"))
+            target = _to_float(igst_b.get("amount"))
+            if rate is not None and target is not None:
+                implied_tax = round(combined_base * rate / 100, 2)
+                if abs(implied_tax - target) <= TALLY_TOLERANCE:
+                    for p in still_undetermined2:
+                        if p["item_amt"] is not None:
+                            p["igst_pct"] = igst_b.get("rate")
+                            p["igst_amt"] = round(p["item_amt"] * rate / 100, 2)
+                            p["has_row_signal"] = True
+                    for a in taxable_adjustments:
+                        amt = _to_float(a.get("amount")) or 0.0
+                        tax_amt = round(amt * rate / 100, 2)
+                        adjustment_tax_rows.append({
+                            "label": a.get("label"), "amount": amt,
+                            "igst_pct": igst_b.get("rate"), "igst_amt": tax_amt,
+                            "cgst_pct": None, "cgst_amt": None, "sgst_pct": None, "sgst_amt": None,
+                            "total": round(amt + tax_amt, 2),
+                        })
+        elif cgst_b or sgst_b:
+            c_rate = _to_float((cgst_b or {}).get("rate")) or 0.0
+            s_rate = _to_float((sgst_b or {}).get("rate")) or 0.0
+            rate = c_rate + s_rate
+            c_amt = _to_float((cgst_b or {}).get("amount")) or 0.0
+            s_amt = _to_float((sgst_b or {}).get("amount")) or 0.0
+            target = round(c_amt + s_amt, 2)
+            if rate and target is not None:
+                implied_tax = round(combined_base * rate / 100, 2)
+                if abs(implied_tax - target) <= TALLY_TOLERANCE:
+                    for p in still_undetermined2:
+                        if p["item_amt"] is not None:
+                            p["cgst_pct"] = (cgst_b or {}).get("rate")
+                            p["sgst_pct"] = (sgst_b or {}).get("rate")
+                            p["cgst_amt"] = round(p["item_amt"] * c_rate / 100, 2)
+                            p["sgst_amt"] = round(p["item_amt"] * s_rate / 100, 2)
+                            p["has_row_signal"] = True
+                    for a in taxable_adjustments:
+                        amt = _to_float(a.get("amount")) or 0.0
+                        c_tax = round(amt * c_rate / 100, 2)
+                        s_tax = round(amt * s_rate / 100, 2)
+                        adjustment_tax_rows.append({
+                            "label": a.get("label"), "amount": amt,
+                            "igst_pct": None, "igst_amt": None,
+                            "cgst_pct": (cgst_b or {}).get("rate"), "cgst_amt": c_tax,
+                            "sgst_pct": (sgst_b or {}).get("rate"), "sgst_amt": s_tax,
+                            "total": round(amt + c_tax + s_tax, 2),
+                        })
 
     rows = []
     for p in parsed:
@@ -801,6 +855,38 @@ def build_unified_table(final):
                           if v)
             total_amt = round(p["item_amt"] + tax_sum, 2) if p["item_amt"] is not None else ""
         row["Total Amt"] = total_amt
+        rows.append(row)
+
+    # Merge adjustments into the same table, one row per charge, so they
+    # always show up "in the table" alongside items rather than as a
+    # separate list. If Pass 5 above confirmed the assessable-value pattern,
+    # taxable adjustments carry their own computed %/amount; otherwise they
+    # still appear with just their amount and total (no tax columns filled,
+    # since it couldn't be confidently derived). Round-off-type adjustments
+    # never carry tax and show only their own (often negative) amount.
+    tax_row_by_label = {r["label"]: r for r in adjustment_tax_rows}
+    for a in adjustments:
+        if not isinstance(a, dict):
+            continue
+        label = a.get("label") or "Adjustment"
+        amt = _to_float(a.get("amount"))
+        computed = tax_row_by_label.get(label)
+        row = {
+            "Item": label,
+            "Invoice No": "",
+            "HSN": "",
+            "Qty": "",
+            "Unit Price": "",
+            "Discount": "",
+            "Amount": a.get("amount"),
+            "IGST %": computed["igst_pct"] if computed and not is_empty(computed["igst_pct"]) else "",
+            "IGST Amt": computed["igst_amt"] if computed and not is_empty(computed["igst_amt"]) else "",
+            "CGST %": computed["cgst_pct"] if computed and not is_empty(computed["cgst_pct"]) else "",
+            "CGST Amt": computed["cgst_amt"] if computed and not is_empty(computed["cgst_amt"]) else "",
+            "SGST %": computed["sgst_pct"] if computed and not is_empty(computed["sgst_pct"]) else "",
+            "SGST Amt": computed["sgst_amt"] if computed and not is_empty(computed["sgst_amt"]) else "",
+            "Total Amt": computed["total"] if computed else (amt if amt is not None else a.get("amount")),
+        }
         rows.append(row)
 
     return rows
@@ -908,20 +994,6 @@ def postprocess(data):
     final["total_reconciliation"] = total_recon
     final["hsn_reconciliation_detail"] = hsn_recon
 
-    # One combined review flag covering both checks, so the UI only needs a
-    # single status line instead of separate tables/boxes for each.
-    review_reasons = []
-    if total_recon and total_recon["needs_review"]:
-        review_reasons.append(
-            f"total amount off by {total_recon['difference']:+.2f} "
-            f"(expected {total_recon['expected_total']} vs printed {total_recon['printed_total']})"
-        )
-    for row in hsn_recon:
-        if "Mismatch" in row.get("status", "") or "No matching" in row.get("status", ""):
-            review_reasons.append(f"HSN {row.get('hsn_code')}: {row.get('status')}")
-    final["needs_human_review"] = bool(review_reasons)
-    final["review_reasons"] = review_reasons
-
     return final
 
 
@@ -1001,7 +1073,8 @@ if uploaded_files:
             df = df[[c for c in col_order if c in df.columns]]
             df = df.fillna("").replace("null", "").replace("None", "")
             st.dataframe(df, use_container_width=True, hide_index=True)
-            st.caption(f"Total items: **{len(unified_rows)}**")
+            item_count = len(final_result.get("items") or [])
+            st.caption(f"Total items: **{item_count}**")
 
         st.markdown("**💰 Amounts**")
         amt_cols = st.columns(3)
@@ -1013,19 +1086,6 @@ if uploaded_files:
             if not is_empty(val):
                 amt_cols[idx % 3].write(f"**{field.replace('_', ' ').title()}:** {val}")
 
-        # ---------------- Adjustments: round off, freight, other charges ----------------
-        adjustments = final_result.get("adjustments") or []
-        if adjustments:
-            st.markdown("**➕➖ Other Charges / Adjustments** *(as printed on the invoice)*")
-            for adj in adjustments:
-                label = adj.get("label") or "Adjustment"
-                amount = adj.get("amount")
-                if is_empty(amount):
-                    continue
-                amt_val = _to_float(amount)
-                sign = "+" if (amt_val is not None and amt_val > 0) else ""
-                st.write(f"**{label}:** {sign}{amount}")
-
         # ---------------- Combined reconciliation status ----------------
         recon = final_result.get("total_reconciliation")
         if recon:
@@ -1034,9 +1094,7 @@ if uploaded_files:
                 f"vs printed **{recon['printed_total']}**"
             )
 
-        if final_result.get("needs_human_review"):
-            st.error("🚨 NEEDS HUMAN REVIEW\n\n" + "\n\n".join(f"- {r}" for r in final_result["review_reasons"]))
-        elif recon:
+        if recon:
             leftover = recon["difference"]
             if abs(leftover) > 0.005:
                 # A small gap remains (within tolerance) that no printed

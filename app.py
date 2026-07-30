@@ -676,6 +676,30 @@ def build_unified_table(final):
                 match["sgst_pct"], match["sgst_amt"] = (sgst_b or {}).get("rate"), (sgst_b or {}).get("amount")
                 match["has_row_signal"] = True
 
+    # Pass 3b — sole line item: if the invoice has exactly ONE line item and
+    # it still has no tax signal, any invoice-level tax has nowhere else it
+    # could possibly belong — attribute it to that item directly. This
+    # covers invoices where tax is charged on the assessable value (item
+    # amount + freight/insurance/loading/certificate, etc.) rather than on
+    # the bare item amount, so the base-matching in Pass 3 above doesn't
+    # line up numerically. With only one item, there's no ambiguity about
+    # which row the printed tax % and amount belong to, so show them there.
+    if len(parsed) == 1 and not parsed[0]["has_row_signal"]:
+        p = parsed[0]
+        if igst_b and not cgst_b and not sgst_b and not is_empty(igst_b.get("amount")):
+            p["igst_pct"], p["igst_amt"] = igst_b.get("rate"), igst_b.get("amount")
+            p["has_row_signal"] = True
+        elif cgst_b or sgst_b:
+            assigned = False
+            if not is_empty((cgst_b or {}).get("amount")):
+                p["cgst_pct"], p["cgst_amt"] = (cgst_b or {}).get("rate"), (cgst_b or {}).get("amount")
+                assigned = True
+            if not is_empty((sgst_b or {}).get("amount")):
+                p["sgst_pct"], p["sgst_amt"] = (sgst_b or {}).get("rate"), (sgst_b or {}).get("amount")
+                assigned = True
+            if assigned:
+                p["has_row_signal"] = True
+
     # Pass 4 — group distribution: the invoice's tax may cover the COMBINED
     # total of every row still undetermined (rather than any single row).
     # Only fires when the group's summed amount matches what the printed

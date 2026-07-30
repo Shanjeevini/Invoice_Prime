@@ -98,6 +98,11 @@ class HsnSummaryLine(BaseModel):
 class InvoiceItem(BaseModel):
     sl_no: Optional[str] = None
     description: Optional[str] = None
+    # Only filled when the line-item table itself prints a distinct invoice
+    # number column with its own value per row (e.g. aggregated settlement
+    # invoices where each transaction row corresponds to a different
+    # underlying invoice). See prompt guidance below.
+    invoice_number: Optional[str] = None
     hsn_sac_code: Optional[str] = None
     quantity: Optional[str] = None
     unit_price: Optional[str] = None
@@ -237,6 +242,15 @@ column position, different invoices order columns differently.
   doesn't apply to that row), leave both null rather than inventing "0".
 - Extract every row of the table, in the order shown, skip none. Do not add columns
   that don't exist on this particular invoice — leave those fields null.
+- Per-row invoice_number: most invoices have ONE invoice number for the whole
+  document (that single case belongs in the top-level invoice_number field, not
+  here). Some invoices — typically aggregated statement/settlement invoices from
+  banks, payment processors, or marketplaces — instead print a distinct "Invoice
+  Number" (or "Bill No.") column INSIDE the line-item table itself, with a
+  DIFFERENT value on each row (one row = one underlying transaction/invoice being
+  settled). Only in that specific case, fill each row's own invoice_number field
+  from that row's own printed value. If the table has no such per-row column,
+  leave every item's invoice_number null.
 - IMPORTANT — tax base per row: whatever "amount" you record for a row is the ONLY
   base that row's tax_rate_percent / tax_amount applies to. Some invoices (e.g.
   travel/booking invoices) print several distinct charge lines — such as a base
@@ -767,6 +781,7 @@ def build_unified_table(final):
             discount_display = ""
         row = {
             "Item": it.get("description"),
+            "Invoice No": it.get("invoice_number") if not is_empty(it.get("invoice_number")) else "",
             "HSN": it.get("hsn_sac_code"),
             "Qty": it.get("quantity"),
             "Unit Price": it.get("unit_price"),
@@ -976,7 +991,9 @@ if uploaded_files:
         if unified_rows:
             import pandas as pd
             st.markdown("**📦 Items & Tax**")
-            col_order = ["Item", "HSN", "Qty", "Unit Price", "Discount", "Amount",
+            has_per_row_invoice_no = any(row.get("Invoice No") for row in unified_rows)
+            col_order = ["Item"] + (["Invoice No"] if has_per_row_invoice_no else []) + \
+                        ["HSN", "Qty", "Unit Price", "Discount", "Amount",
                          "IGST %", "IGST Amt", "CGST %", "CGST Amt", "SGST %", "SGST Amt",
                          "Total Amt"]
             df = pd.DataFrame(unified_rows)

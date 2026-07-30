@@ -634,6 +634,32 @@ def build_unified_table(final):
             "has_explicit_split": has_explicit_split, "has_row_signal": has_row_signal,
         })
 
+    # Pass 1b — backfill a missing rate % when a row already has an
+    # explicit, nonzero tax AMOUNT printed directly on it, but no rate
+    # alongside it. Some invoices print CGST/SGST/IGST amounts per
+    # transaction row in the main table, while the applicable rate(s) are
+    # only shown once, in a separate invoice-level "GST Rate" box (e.g.
+    # "IGST Rate: 18%") rather than repeated per row. No invoice charges a
+    # nonzero tax amount without an applicable rate existing somewhere, so
+    # when exactly that situation appears — amount present, rate missing —
+    # pull the rate from the matching invoice-level bucket. Zero-amount
+    # rows (commonly exempt items) are deliberately left without a rate,
+    # since tagging an exempt row with the standard rate would misstate it
+    # as taxed.
+    for p in parsed:
+        igst_amt_val = _to_float(p["igst_amt"])
+        if is_empty(p["igst_pct"]) and igst_amt_val and igst_amt_val > 0 \
+                and igst_b and not is_empty(igst_b.get("rate")):
+            p["igst_pct"] = igst_b.get("rate")
+        cgst_amt_val = _to_float(p["cgst_amt"])
+        if is_empty(p["cgst_pct"]) and cgst_amt_val and cgst_amt_val > 0 \
+                and cgst_b and not is_empty(cgst_b.get("rate")):
+            p["cgst_pct"] = cgst_b.get("rate")
+        sgst_amt_val = _to_float(p["sgst_amt"])
+        if is_empty(p["sgst_pct"]) and sgst_amt_val and sgst_amt_val > 0 \
+                and sgst_b and not is_empty(sgst_b.get("rate")):
+            p["sgst_pct"] = sgst_b.get("rate")
+
     # Pass 2 — route each row's own generic tax figure into the right columns.
     for p in parsed:
         if p["has_explicit_split"] or not p["has_row_signal"]:

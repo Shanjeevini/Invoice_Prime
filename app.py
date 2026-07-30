@@ -448,6 +448,19 @@ def match_items_to_hsn(items, hsn_summary):
 # where tax only applies to part of the invoice (e.g. service fee, not
 # fare) by falling back to summing each line item's own total when a clean
 # subtotal + tax path isn't available.
+#
+# IMPORTANT: many invoices charge tax on the ASSESSABLE VALUE — i.e. the
+# subtotal PLUS adjustments like freight/insurance/loading/certificate
+# charges — rather than on each line item individually. In that layout,
+# no single item row carries the tax, so the per-item "Total Amt" column
+# in the unified table never includes it. If the reconciliation only sums
+# item totals + adjustments, it silently omits that invoice-level tax and
+# flags a false mismatch equal to the tax amount. To avoid that, this
+# function separately tracks how much of the invoice's printed tax was
+# actually allocated to line items (via the unified table's IGST/CGST/SGST
+# columns) versus how much is still unaccounted for, and adds any
+# unallocated tax back into the expected total before comparing against
+# the printed total.
 # ---------------------------------------------------------------------------
 def reconcile_invoice_totals(final):
     total_amount = _to_float(final.get("total_amount"))
@@ -467,23 +480,46 @@ def reconcile_invoice_totals(final):
     # usable item data at all.
     unified_rows = final.get("unified_table") or []
     items_total = 0.0
+    allocated_tax = 0.0
     any_item_data = False
     for row in unified_rows:
         t = _to_float(row.get("Total Amt"))
         if t is not None:
             items_total += t
             any_item_data = True
+        for tax_col in ("IGST Amt", "CGST Amt", "SGST Amt"):
+            v = _to_float(row.get(tax_col))
+            if v is not None:
+                allocated_tax += v
+
+    # What the invoice actually prints as its total tax (either a single
+    # "total_tax" figure, or the sum of the distinct "taxes" lines).
+    total_tax = _to_float(final.get("total_tax"))
+    taxes = final.get("taxes") or []
+    taxes_sum = sum((_to_float(t.get("amount")) or 0.0) for t in taxes if isinstance(t, dict))
+    printed_tax = total_tax if total_tax is not None else (taxes_sum if taxes else None)
+
+    # Tax that is printed on the invoice but was never distributed to any
+    # line item (e.g. tax charged on subtotal + freight/insurance/etc.
+    # rather than per item) — this must be added back in separately or the
+    # reconciliation understates the expected total.
+    unallocated_tax = 0.0
+    if printed_tax is not None:
+        remainder = round(printed_tax - allocated_tax, 2)
+        if remainder > TALLY_TOLERANCE:
+            unallocated_tax = remainder
 
     if any_item_data:
-        expected_total = round(items_total + adjustments_sum, 2)
-        basis = ("sum of each line item's own total + adjustments" if adjustments
-                  else "sum of each line item's own total")
+        expected_total = round(items_total + adjustments_sum + unallocated_tax, 2)
+        basis_parts = ["sum of each line item's own total"]
+        if adjustments:
+            basis_parts.append("adjustments")
+        if unallocated_tax:
+            basis_parts.append("invoice-level tax not tied to a specific item")
+        basis = " + ".join(basis_parts)
     else:
         subtotal = _to_float(final.get("subtotal"))
-        total_tax = _to_float(final.get("total_tax"))
-        taxes = final.get("taxes") or []
-        taxes_sum = sum((_to_float(t.get("amount")) or 0.0) for t in taxes if isinstance(t, dict))
-        effective_tax = total_tax if total_tax is not None else (taxes_sum if taxes else None)
+        effective_tax = printed_tax
 
         discount = _to_float(final.get("invoice_discount_amount"))
         if discount is None and final.get("invoice_discount_percent") and subtotal is not None:

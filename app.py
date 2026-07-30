@@ -819,8 +819,19 @@ def postprocess(data):
     taxes = final.get("taxes") or []
     total_tax = final.get("total_tax")
     if len(taxes) == 1 and total_tax:
-        only_amount = taxes[0].get("amount") if isinstance(taxes[0], dict) else None
-        if only_amount and str(only_amount).strip() == str(total_tax).strip():
+        only = taxes[0]
+        only_amount = only.get("amount") if isinstance(only, dict) else None
+        only_label = (only.get("label") or "").upper() if isinstance(only, dict) else ""
+        # Only treat this as a duplicate placeholder (safe to drop) when the
+        # label is generic/ambiguous (e.g. "Tax", "GST %"). A specifically
+        # named tax type — CGST/SGST/IGST/VAT — carries real information
+        # (which tax regime applies) that gst_breakdown / the unified item
+        # table depend on to show % and amount against the line item, even
+        # when its amount happens to equal total_tax (the normal case when
+        # there's only one tax line on the invoice). Clearing it in that
+        # case would silently blank out the IGST/CGST/SGST columns.
+        is_specific_type = any(k in only_label for k in ["CGST", "SGST", "IGST", "VAT"])
+        if only_amount and str(only_amount).strip() == str(total_tax).strip() and not is_specific_type:
             final["taxes"] = []
 
     hsn = final.get("hsn_sac_code")

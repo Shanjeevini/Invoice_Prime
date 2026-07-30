@@ -11,7 +11,7 @@ from google.genai import types
 _api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
 client = genai.Client(api_key=_api_key)
 
-GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 
 st.set_page_config(page_title="Invoice Extractor", layout="wide")
 

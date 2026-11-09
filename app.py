@@ -23,7 +23,7 @@ KNOWN_VENDOR_LABELS = [
 ]
 KNOWN_CUSTOMER_LABELS = [
     "billing address", "bill to", "buyer", "customer", "to", "sold to",
-    "consignee", "client",
+     "client",
 ]
 KNOWN_TAX_LABELS = [
     "cgst", "sgst", "igst", "vat", "gst", "service tax", "cess", "tax",
